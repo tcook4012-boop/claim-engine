@@ -291,6 +291,21 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 const mapOrder = (o) => ({ id: o._id, ref: o[REF_FIELD] || o._id, deadline: o[F.claimDeadline] });
 
+// ---- Shared-secret auth for admin endpoints --------------------------------
+// Set ADMIN_SECRET as a Railway variable. Any caller (the Bubble admin page)
+// must send it in the "x-admin-secret" header. Without a matching secret, the
+// admin endpoints reject the request. If ADMIN_SECRET is unset, admin endpoints
+// are DISABLED entirely (fail closed) rather than left open.
+const ADMIN_SECRET = process.env.ADMIN_SECRET || "";
+function requireAdmin(req, res, next) {
+  if (!ADMIN_SECRET) return res.status(503).json({ error: "admin endpoints disabled: ADMIN_SECRET not set" });
+  const sent = req.get("x-admin-secret") || "";
+  // constant-time-ish compare
+  if (sent.length !== ADMIN_SECRET.length || sent !== ADMIN_SECRET)
+    return res.status(401).json({ error: "unauthorized" });
+  next();
+}
+
 app.get("/api/my-orders", async (req, res) => {
   try {
     const email = String(req.query.email || "");
@@ -316,7 +331,7 @@ app.post("/api/claim", async (req, res) => {
 });
 
 // Admin push: force an order onto a vendor (auto-claimed, over cap allowed).
-app.post("/api/force-assign", async (req, res) => {
+app.post("/api/force-assign", requireAdmin, async (req, res) => {
   const { email, orderId } = req.body;
   try { res.json(await withLock(orderId, () => forceAssign(orderId, email))); }
   catch (e) { res.status(500).json({ error: e.message }); }
@@ -325,7 +340,7 @@ app.post("/api/force-assign", async (req, res) => {
 // Admin dashboard: unclaimed orders still in rotation, surfaced oldest-first
 // (FIFO) with age + rotation/pass counts so admin can spot ones worth pushing.
 // Nothing is ever "parked" -- these are all still actively rotating.
-app.get("/api/aging", async (_req, res) => {
+app.get("/api/aging", requireAdmin, async (_req, res) => {
   try {
     const rows = await search("uploaded_image", [{ key: F.claimState, constraint_type: "equals", value: CS.unclaimed }]);
     const now = Date.now();
