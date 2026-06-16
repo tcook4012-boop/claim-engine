@@ -313,6 +313,16 @@ function mountVendorPortal(app, deps) {
     res.json({ ok: true });
   });
 
+  // ---- TEMP DEBUG: raw order JSON (admin only) — REMOVE after field-name check.
+  // Visit /vendor/api/admin/raw-order?id=<orderId> while logged in as admin.
+  // The JSON keys are the EXACT Bubble API field names (case-sensitive).
+  app.get("/vendor/api/admin/raw-order", requireAdminLogin, async (req, res) => {
+    try {
+      const o = await getOrder(String(req.query.id || ""));
+      res.type("json").send(JSON.stringify(o, null, 2));
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
   // ---- PAGES (served HTML) -------------------------------------------------
   app.get("/vendor/login", (_req, res) => res.type("html").send(LOGIN_HTML));
   app.get("/vendor", requireVendor, (_req, res) => res.type("html").send(PORTAL_HTML));
