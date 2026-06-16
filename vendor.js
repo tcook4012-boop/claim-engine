@@ -367,6 +367,18 @@ function mountVendorPortal(app, deps) {
     res.json({ ok: true });
   });
 
+  // ---- TEMP DEBUG: raw record JSON (admin only) — REMOVE after field-name check.
+  // /vendor/api/admin/raw?type=team&id=<id>   (type defaults to uploaded_image)
+  // JSON keys are the EXACT Bubble API field names. Empty fields are omitted by Bubble.
+  app.get("/vendor/api/admin/raw", requireAdminLogin, async (req, res) => {
+    try {
+      const type = String(req.query.type || "uploaded_image");
+      const id = String(req.query.id || "");
+      const rec = await bubble("GET", `/${type}/${id}`).then(r => r.response);
+      res.type("json").send(JSON.stringify(rec, null, 2));
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
 
   // ---- PAGES (served HTML) -------------------------------------------------
   app.get("/vendor/login", (_req, res) => res.type("html").send(LOGIN_HTML));
