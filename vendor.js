@@ -148,8 +148,27 @@ function mountVendorPortal(app, deps) {
     if (Array.isArray(o.Supporting_Files)) o.Supporting_Files.forEach((f, i) => push(`Supporting ${i + 1}`, f));
     return out;
   }
-  function orderView(o) {
-    return {
+  // Fetch a Team's vendor-facing docs (templates + special instructions). FAIL-SAFE:
+  // any error (Team not API-exposed, missing field, bad id) returns empty, never throws,
+  // so the order card always renders even if the team lookup can't complete.
+  async function teamDocs(teamId, cache) {
+    if (!teamId) return { templates: [], instructions: "" };
+    if (cache && cache.has(teamId)) return cache.get(teamId);
+    const linkify = (val) => (!val ? null : (String(val).startsWith("//") ? "https:" + val : String(val)));
+    let docs = { templates: [], instructions: "" };
+    try {
+      const t = await bubble("GET", `/team/${teamId}`).then(r => r.response);
+      [["Template 1", t.Client_Template_1], ["Template 2", t.Client_Template_2], ["Template 3", t.Client_Template_3]]
+        .forEach(([label, val]) => { const u = linkify(val); if (u) docs.templates.push({ label, url: u }); });
+      docs.instructions = t.Client_Special_Instructions || "";
+    } catch (e) { console.warn("[teamDocs] lookup failed for team " + teamId + ":", e.message); }
+    if (cache) cache.set(teamId, docs);
+    return docs;
+  }
+
+  function orderView(o, team) {
+    const thumb = o.image ? (String(o.image).startsWith("//") ? "https:" + o.image : String(o.image)) : "";
+    const v = {
       id: o._id,
       ref: o[REF_FIELD] || "",
       orderNo: o["Order#"] || "",
@@ -157,7 +176,11 @@ function mountVendorPortal(app, deps) {
       user: o.User || "",
       state: o[F.claimState] || "",
       claimDeadline: o[F.claimDeadline] || null,
+      claimedAt: o.claimed_at || null,
       separations: o[F.separations] || "no",
+      rush: o.Rush || "no",
+      specialInstructions: o.Special_Instructions || "",
+      thumb,
       files: fileLinks(o),
       details: {
         ArtDims_Seps: o.ArtDims_Seps || "", FilmSizeSeps: o.FilmSizeSeps || "",
@@ -165,6 +188,8 @@ function mountVendorPortal(app, deps) {
         Unit: o.Unit || "", "cm/in": o["cm/in"] || "",
       },
     };
+    if (team) v.team = team;
+    return v;
   }
 
   app.get("/vendor/api/orders", requireVendor, async (req, res) => {
@@ -179,11 +204,14 @@ function mountVendorPortal(app, deps) {
         { key: F.assignedArtist, constraint_type: "equals", value: email },
         { key: F.claimState, constraint_type: "equals", value: CS.claimed }]);
       const underLimit = mine.length < limit;
+      const teamCache = new Map();
+      const claimedViews = await Promise.all(mine.map(async (o) =>
+        orderView(o, await teamDocs(o.Team_Name, teamCache))));
       res.json({
         email, limit, openCount: mine.length, underLimit,
         actingAs: req.session.actingAs || null,
-        claimable: claimable.map(orderView),
-        claimed: mine.map(orderView),
+        claimable: claimable.map((o) => orderView(o)),
+        claimed: claimedViews,
       });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
@@ -404,6 +432,13 @@ button{padding:8px 14px;border:0;border-radius:8px;cursor:pointer;font-size:14px
 .claim{background:#16a34a;color:#fff}.upload{background:#2563eb;color:#fff}.link{background:#e2e8f0;color:#0f172a;text-decoration:none;display:inline-block;margin:3px 4px 0 0;padding:6px 10px;border-radius:6px;font-size:13px}
 .logout{background:rgba(255,255,255,.2);color:#fff}.details{font-size:13px;color:#475569;margin-top:8px;display:none}
 .muted{color:#94a3b8;font-size:14px}.sep{color:#b45309;font-weight:600;font-size:12px}
+.thumb{width:72px;height:72px;object-fit:cover;border-radius:8px;border:1px solid #e2e8f0;background:#fff;flex:none}
+.cdetails{display:flex;gap:12px;margin-top:10px;align-items:flex-start}.cmeta{flex:1;min-width:0}
+.badge{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;margin:0 5px 5px 0;letter-spacing:.02em}
+.b-type{background:#eef2ff;color:#3730a3}.b-rush{background:#fee2e2;color:#b91c1c}.b-sep{background:#fef3c7;color:#92400e}
+.timer{font-size:12px;color:#475569;margin:2px 0 4px}
+.notes{font-size:13px;color:#334155;background:#f8fafc;border-left:3px solid #cbd5e1;padding:6px 10px;border-radius:4px;margin-top:8px;white-space:pre-wrap}
+.tmpl{margin-top:8px}.tmpl .link{background:#dbeafe;color:#1e40af}.tmpl-label{font-size:12px;color:#64748b;font-weight:700;margin-bottom:3px}
 </style></head><body>
 <div id=banner class=banner style=display:none></div>
 <header><h1>PrintReadyArt — My Orders</h1><button class=logout onclick=logout()>Log out</button></header>
@@ -424,10 +459,26 @@ async function load(){
 }
 function card(o,claimed){
   const files=o.files.map(f=>'<a class=link target=_blank href="'+f.url+'">⬇ '+f.label+'</a>').join('');
-  const sep=o.separations==='yes'?'<span class=sep>SEPARATIONS</span> ':'';
+  const sep=(!claimed&&o.separations==='yes')?'<span class=sep>SEPARATIONS</span> ':'';
   let action='';
   if(!claimed){action=data.underLimit?'<button class=claim onclick="claim(\\''+o.id+'\\')">Claim</button>':'<span class=tag>at limit</span>';}
   else{action='<button class=upload onclick="openUpload(\\''+o.id+'\\')">Upload completed</button>';}
+  let rich='';
+  if(claimed){
+    const badges='<span class="badge b-type">'+esc(o.type||'—')+'</span>'+
+      (o.rush==='yes'?'<span class="badge b-rush">RUSH</span>':'')+
+      (o.separations==='yes'?'<span class="badge b-sep">SEPARATIONS</span>':'');
+    const thumb=o.thumb?'<img class=thumb src="'+o.thumb+'" alt="artwork" onerror="this.style.display=\\'none\\'">':'';
+    const timer=o.claimedAt?'<div class=timer data-since="'+o.claimedAt+'">\\u23F1 claimed '+fmtElapsed(o.claimedAt)+' ago</div>':'';
+    const notes=o.specialInstructions?'<div class=notes><b>Special instructions:</b> '+esc(o.specialInstructions)+'</div>':'';
+    let tmpl='';
+    if(o.team){
+      const tl=(o.team.templates||[]).map(t=>'<a class=link target=_blank href="'+t.url+'">\\u2B07 '+esc(t.label)+'</a>').join('');
+      const ti=o.team.instructions?'<div class=notes><b>Team instructions:</b> '+esc(o.team.instructions)+'</div>':'';
+      if(tl||ti)tmpl='<div class=tmpl><div class=tmpl-label>Team templates &amp; instructions</div>'+tl+ti+'</div>';
+    }
+    rich='<div class=cdetails>'+thumb+'<div class=cmeta>'+badges+timer+notes+tmpl+'</div></div>';
+  }
   let uploadBox='';
   if(claimed){
     const emb=(o.type||'').toLowerCase()==='digitizing';
@@ -452,8 +503,20 @@ function card(o,claimed){
   const subline=o.ref?('Order '+o.orderNo+' · '+o.type):o.type;
   return '<div class=card><div class=row><div><span class=ref>'+title+'</span> '+sep+
     '<div class=tag>'+subline+'</div></div><div>'+action+'</div></div>'+
+    rich+
     (claimed?('<div style=margin-top:10px>'+files+'</div>'+uploadBox):'')+
     '</div>';
+}
+function esc(s){return String(s==null?'':s).replace(/[<>&]/g,function(c){return c==='<'?'&lt;':c==='>'?'&gt;':'&amp;';});}
+function fmtElapsed(since){
+  if(!since)return '';
+  var ms=Date.now()-new Date(since).getTime();
+  if(isNaN(ms)||ms<0)return 'just now';
+  var m=Math.floor(ms/60000),h=Math.floor(m/60),d=Math.floor(h/24);
+  if(d>0)return d+'d '+(h%24)+'h';
+  if(h>0)return h+'h '+(m%60)+'m';
+  if(m>0)return m+'m';
+  return 'just now';
 }
 function openUpload(id){const b=document.getElementById('up'+id);b.style.display=b.style.display==='none'?'block':'none';}
 async function claim(id){
@@ -484,6 +547,11 @@ async function submitUpload(id,emb){
 async function logout(){await fetch('/vendor/api/logout',{method:'POST'});location.href='/vendor/login';}
 async function stopRunAs(){await fetch('/vendor/api/admin/stop-run-as',{method:'POST'});location.href='/vendor/admin';}
 function anyUploadOpen(){return [...document.querySelectorAll('.uploadbox')].some(el=>el.style.display==='block');}
+setInterval(function(){
+  document.querySelectorAll('.timer[data-since]').forEach(function(el){
+    el.textContent='\\u23F1 claimed '+fmtElapsed(el.getAttribute('data-since'))+' ago';
+  });
+},1000);
 load();
 setInterval(()=>{if(!anyUploadOpen())load();},30000);
 </script></body></html>`;
