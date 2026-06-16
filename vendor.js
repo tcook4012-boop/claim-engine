@@ -198,17 +198,29 @@ function mountVendorPortal(app, deps) {
     } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
   });
 
-  // ---- UPLOAD COMPLETED WORK  (real fields: Image + Supporting_Files) ------
-  // Preview JPEG -> Image ; other files -> Supporting_Files list ; Pending -> no.
-  // Bubble has NO /fileupload endpoint. For a file/image field you set the value
-  // DIRECTLY in the PATCH to the thing, as { filename, contents(base64), private }.
-  // Bubble stores the bytes and returns the file URL on subsequent reads.
+  // ---- UPLOAD COMPLETED WORK  (real fields: image + Supporting_Files) ------
+  // Preview -> single `image` field ; supporting files -> `Supporting_Files` list ;
+  // Pending -> no. Bubble has NO /fileupload endpoint, and a LIST-of-files field will
+  // only accept hosted URL strings (not raw base64). A SINGLE file field accepts the
+  // base64 object and exposes the hosted URL on the next read. So supporting files are
+  // converted to URLs one at a time through the `vendor_scratch_file` pad, then the URL
+  // list is written to Supporting_Files. The pad is blanked afterward (best-effort).
   function bubbleFile(file) {
     return {
       filename: file.originalname,
       contents: file.buffer.toString("base64"),
       private: false,
     };
+  }
+
+  // Push one file's bytes through the scratch pad and return its hosted Bubble URL.
+  async function uploadFileGetUrl(orderId, file) {
+    await patchOrder(orderId, { vendor_scratch_file: bubbleFile(file) });
+    const fresh = await getOrder(orderId);
+    let url = fresh && fresh.vendor_scratch_file ? String(fresh.vendor_scratch_file) : "";
+    if (!url) throw new Error(`Scratch upload returned no URL for ${file.originalname}`);
+    if (url.startsWith("//")) url = "https:" + url;
+    return url;
   }
 
   // Accepts: "preview" (single JPEG -> Image) and "supporting" (multiple -> Supporting_Files).
@@ -256,17 +268,31 @@ function mountVendorPortal(app, deps) {
         patch.Stitch_Count = Number(stitch);
       }
 
-      // Preview JPEG -> image field (lowercase, confirmed from raw API JSON).
+      // Preview -> single `image` field (base64 object on a single field works).
       if (previewFile) {
         patch.image = bubbleFile(previewFile);
       }
 
-      // Supporting files -> OVERRIDE Supporting_Files (replace whatever's there).
+      // Supporting files -> convert each to a hosted URL via the scratch pad, then
+      // OVERRIDE Supporting_Files with the URL list (a list field only takes URLs).
+      let usedScratch = false;
       if (supportFiles.length) {
-        patch.Supporting_Files = supportFiles.map(bubbleFile);
+        const urls = [];
+        for (const f of supportFiles) urls.push(await uploadFileGetUrl(orderId, f));
+        patch.Supporting_Files = urls;
+        usedScratch = true;
       }
 
+      // Final atomic completion write.
       await patchOrder(orderId, patch);
+
+      // Best-effort: blank the scratch pad. It never holds real data, so a lingering
+      // value is harmless and gets overwritten on the next upload.
+      if (usedScratch) {
+        try { await patchOrder(orderId, { vendor_scratch_file: "" }); }
+        catch (e) { console.warn("[upload] scratch clear failed:", e.message); }
+      }
+
       await logEvent(orderId, email, "completed_uploaded",
         `${previewFile ? "preview" : "no preview"}; ${supportFiles.length} supporting file(s)`);
       res.json({ ok: true, preview: !!previewFile, supporting: supportFiles.length });
