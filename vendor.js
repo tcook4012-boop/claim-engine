@@ -151,7 +151,7 @@ function mountVendorPortal(app, deps) {
   function orderView(o) {
     return {
       id: o._id,
-      ref: o[REF_FIELD] || o._id,
+      ref: o[REF_FIELD] || "",
       orderNo: o["Order#"] || "",
       type: o.Order_Type || "",
       user: o.User || "",
@@ -247,7 +247,7 @@ function mountVendorPortal(app, deps) {
 
       const patch = {
         Pending: false, Edit_Requested: false, [F.claimState]: "completed",
-        Artist_reported_count: Number(logos),
+        artist_reported_count: Number(logos),
       };
 
       if (isEmbroidery) {
@@ -256,9 +256,9 @@ function mountVendorPortal(app, deps) {
         patch.Stitch_Count = Number(stitch);
       }
 
-      // Preview JPEG -> Image field (base64 embedded directly in the PATCH).
+      // Preview JPEG -> image field (lowercase, confirmed from raw API JSON).
       if (previewFile) {
-        patch.Image = bubbleFile(previewFile);
+        patch.image = bubbleFile(previewFile);
       }
 
       // Supporting files -> OVERRIDE Supporting_Files (replace whatever's there).
@@ -313,15 +313,6 @@ function mountVendorPortal(app, deps) {
     res.json({ ok: true });
   });
 
-  // ---- TEMP DEBUG: raw order JSON (admin only) — REMOVE after field-name check.
-  // Visit /vendor/api/admin/raw-order?id=<orderId> while logged in as admin.
-  // The JSON keys are the EXACT Bubble API field names (case-sensitive).
-  app.get("/vendor/api/admin/raw-order", requireAdminLogin, async (req, res) => {
-    try {
-      const o = await getOrder(String(req.query.id || ""));
-      res.type("json").send(JSON.stringify(o, null, 2));
-    } catch (e) { res.status(500).json({ error: e.message }); }
-  });
 
   // ---- PAGES (served HTML) -------------------------------------------------
   app.get("/vendor/login", (_req, res) => res.type("html").send(LOGIN_HTML));
@@ -431,8 +422,10 @@ function card(o,claimed){
       '<div style=margin-top:10px><button class=upload onclick="submitUpload(\\''+o.id+'\\','+emb+')">Submit & mark complete</button></div>'+
       '</div>';
   }
-  return '<div class=card><div class=row><div><span class=ref>'+o.ref+'</span> '+sep+
-    '<div class=tag>Order '+o.orderNo+' · '+o.type+'</div></div><div>'+action+'</div></div>'+
+  const title=o.ref||('Order '+o.orderNo);
+  const subline=o.ref?('Order '+o.orderNo+' · '+o.type):o.type;
+  return '<div class=card><div class=row><div><span class=ref>'+title+'</span> '+sep+
+    '<div class=tag>'+subline+'</div></div><div>'+action+'</div></div>'+
     (claimed?('<div style=margin-top:10px>'+files+'</div>'+uploadBox):'')+
     '</div>';
 }
