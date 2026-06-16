@@ -199,19 +199,16 @@ function mountVendorPortal(app, deps) {
   });
 
   // ---- UPLOAD COMPLETED WORK  (real fields: Image + Supporting_Files) ------
-  // Preview JPEG -> Image ; other files -> appended to Supporting_Files list ;
-  // Pending -> no. Uses Bubble's /fileupload to store bytes, gets URLs back.
-  async function uploadToBubble(filename, buffer) {
-    const fileEndpoint = BUBBLE_BASE.replace(/\/obj\/?$/, "") + "/fileupload";
-    const res = await fetch(fileEndpoint, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${BUBBLE_TOKEN}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ name: filename, contents: buffer.toString("base64") }),
-    });
-    if (!res.ok) throw new Error(`Bubble fileupload (${filename}) -> ${res.status} ${await res.text()}`);
-    let url = (await res.text()).trim().replace(/^"|"$/g, "");
-    if (url.startsWith("//")) url = "https:" + url;
-    return url;
+  // Preview JPEG -> Image ; other files -> Supporting_Files list ; Pending -> no.
+  // Bubble has NO /fileupload endpoint. For a file/image field you set the value
+  // DIRECTLY in the PATCH to the thing, as { filename, contents(base64), private }.
+  // Bubble stores the bytes and returns the file URL on subsequent reads.
+  function bubbleFile(file) {
+    return {
+      filename: file.originalname,
+      contents: file.buffer.toString("base64"),
+      private: false,
+    };
   }
 
   // Accepts: "preview" (single JPEG -> Image) and "supporting" (multiple -> Supporting_Files).
@@ -259,16 +256,14 @@ function mountVendorPortal(app, deps) {
         patch.Stitch_Count = Number(stitch);
       }
 
-      // Preview JPEG -> Image field
+      // Preview JPEG -> Image field (base64 embedded directly in the PATCH).
       if (previewFile) {
-        patch.Image = await uploadToBubble(previewFile.originalname, previewFile.buffer);
+        patch.Image = bubbleFile(previewFile);
       }
 
       // Supporting files -> OVERRIDE Supporting_Files (replace whatever's there).
       if (supportFiles.length) {
-        const urls = [];
-        for (const f of supportFiles) urls.push(await uploadToBubble(f.originalname, f.buffer));
-        patch.Supporting_Files = urls;
+        patch.Supporting_Files = supportFiles.map(bubbleFile);
       }
 
       await patchOrder(orderId, patch);
