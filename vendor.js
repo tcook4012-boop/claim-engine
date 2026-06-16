@@ -415,7 +415,7 @@ function card(o,claimed){
       '<input id=h'+o.id+' type=number placeholder="Height" style=width:90px>'+
       '<input id=sc'+o.id+' type=number placeholder="Stitch count" style=width:120px>'
     ):'';
-    uploadBox='<div id=up'+o.id+' style="display:none;margin-top:10px;padding:10px;background:#f8fafc;border-radius:8px">'+
+    uploadBox='<div id=up'+o.id+' class=uploadbox style="display:none;margin-top:10px;padding:10px;background:#f8fafc;border-radius:8px">'+
       '<div class=tag>Preview JPEG (before/after) → Image:</div>'+
       '<input id=prev'+o.id+' type=file accept="image/*">'+
       '<div class=tag style=margin-top:8px>Supporting files (replaces existing):</div>'+
@@ -459,7 +459,9 @@ async function submitUpload(id,emb){
 }
 async function logout(){await fetch('/vendor/api/logout',{method:'POST'});location.href='/vendor/login';}
 async function stopRunAs(){await fetch('/vendor/api/admin/stop-run-as',{method:'POST'});location.href='/vendor/admin';}
-load();setInterval(load,30000);
+function anyUploadOpen(){return [...document.querySelectorAll('.uploadbox')].some(el=>el.style.display==='block');}
+load();
+setInterval(()=>{if(!anyUploadOpen())load();},30000);
 </script></body></html>`;
 
 const ADMIN_HTML = `<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1">
