@@ -56,6 +56,10 @@ const YES = true;
 
 function requiredCapsForOrder(o) {
   const caps = [];
+  // Order type -> capability tag. (OFM/PFX routing to be added once we know the field.)
+  const TYPE_CAP = { "Vector": "vector", "Digitizing": "digitizing", "Digital (DTF/DTG)": "digital_printing" };
+  const t = TYPE_CAP[o.Order_Type];
+  if (t) caps.push(t);
   if (o[F.separations] === "yes" || o[F.separations] === true) caps.push("separations");
   return caps;
 }
@@ -97,7 +101,13 @@ const activeVendors = () =>
 async function eligibleVendors(order) {
   const need = requiredCapsForOrder(order);
   const all = await activeVendors();
-  return need.length ? all.filter(v => need.every(c => v.capabilities.includes(c))) : all;
+  if (!need.length) return all;
+  const capable = all.filter(v => need.every(c => (v.capabilities || []).map(x => String(x).toLowerCase()).includes(c)));
+  if (capable.length) return capable;
+  // No active vendor carries the required capabilities. Don't strand the order — fall
+  // back to all active vendors and warn loudly so an admin sets capabilities in the grid.
+  console.warn(`[routing] no vendor has caps [${need.join(", ")}] for order ${order._id} (type "${order.Order_Type}") -- falling back to all active vendors`);
+  return all;
 }
 // A vendor's "load" against their cap = active claimed work PLUS open edit requests
 // (edit requests are unpaid rework; counting them throttles new paid intake until edits
