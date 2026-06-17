@@ -408,6 +408,32 @@ function mountVendorPortal(app, deps) {
     } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
   });
 
+  // Create a brand-new vendor: a new artist record (order-ready) + optional login.
+  app.post("/vendor/api/admin/create-vendor", express.json(), requireAdminLogin, async (req, res) => {
+    try {
+      const email = String(req.body.email || "").toLowerCase().trim();
+      const contact = String(req.body.contact || "").trim();
+      const temp = String(req.body.tempPassword || "").trim();
+      if (!email) return res.status(400).json({ ok: false, error: "Email is required" });
+      if (temp && temp.length < 8) return res.status(400).json({ ok: false, error: "Temp password must be 8+ characters" });
+      const rec = {
+        email,
+        contact: contact || email,
+        is_active_vendor: req.body.active !== false,
+        capabilities: Array.isArray(req.body.capabilities)
+          ? [...new Set(req.body.capabilities.map((s) => String(s).toLowerCase().trim()).filter(Boolean))] : [],
+      };
+      if (req.body.maxConcurrent !== undefined && req.body.maxConcurrent !== "" && req.body.maxConcurrent !== null)
+        rec.max_concurrent_orders = Number(req.body.maxConcurrent);
+      if (req.body.phone) rec["phone number"] = String(req.body.phone).trim();
+      await bubble("POST", "/artist", rec);
+      console.log(`[admin] new vendor created: ${email}`);
+      let loginCreated = false;
+      if (temp && !(await findLogin(email))) { await createLogin(email, temp); loginCreated = true; }
+      res.json({ ok: true, loginCreated });
+    } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+  });
+
   // Run-as: admin starts impersonating a vendor (full actions, logged).
   app.post("/vendor/api/admin/run-as", express.json(), requireAdminLogin, async (req, res) => {
     const email = String(req.body.email || "").toLowerCase().trim();
@@ -780,7 +806,62 @@ button{padding:7px 12px;border:0;border-radius:8px;cursor:pointer;font-size:13px
 input{padding:8px;border:1px solid #cbd5e1;border-radius:6px}.tag{font-size:12px;color:#64748b}
 </style></head><body>
 <header><h1 style=font-size:17px;margin:0>Vendor Admin</h1><div><a href="/vendor/admin/controls" style="color:#93c5fd;text-decoration:none;margin-right:16px;font-size:14px">⚙ Vendor controls</a><button class=logout onclick=logout()>Log out</button></div></header>
-<main><div id=list></div></main><script>
+<main>
+<div style="text-align:right;margin-bottom:12px"><button class=create onclick="toggleAdd()" id=addToggle>+ Add new vendor</button></div>
+<div id=addForm style="display:none;background:#fff;border-radius:10px;padding:16px;margin-bottom:16px;box-shadow:0 1px 4px rgba(0,0,0,.06)">
+  <div style="font-weight:700;margin-bottom:10px">New vendor</div>
+  <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
+    <input id=nvName placeholder="Name">
+    <input id=nvEmail placeholder="Email (required)">
+    <input id=nvPhone placeholder="Phone (optional)">
+    <label class=tag>Max concurrent <input id=nvMax type=number min=0 value=3 style=width:60px></label>
+    <label class=tag><input type=checkbox id=nvActive checked> Active</label>
+  </div>
+  <div class=tag style="margin:12px 0 6px">Capabilities</div>
+  <div id=nvCaps style="display:flex;flex-wrap:wrap;gap:10px"></div>
+  <div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center">
+    <input id=nvPw placeholder="Temp password (optional, 8+ to also create login)">
+    <button class=create onclick="createVendor()">Create vendor</button>
+    <span id=nvMsg class=tag></span>
+  </div>
+</div>
+<div id=list></div></main><script>
+const NVCAPS=['vector','separations','digitizing','ofm','pfx','digital_printing'];
+const NVLABEL={digital_printing:'Digital (DTF/DTG)'};
+function toggleAdd(){
+  const f=document.getElementById('addForm');
+  const open=f.style.display==='none';
+  f.style.display=open?'block':'none';
+  document.getElementById('addToggle').textContent=open?'Close':'+ Add new vendor';
+  if(open&&!document.getElementById('nvCaps').childElementCount){
+    document.getElementById('nvCaps').innerHTML=NVCAPS.map(function(t){
+      return '<label class=tag><input type=checkbox data-cap="'+t+'"> '+(NVLABEL[t]||t)+'</label>';
+    }).join('');
+  }
+}
+async function createVendor(){
+  const msg=document.getElementById('nvMsg');
+  const email=document.getElementById('nvEmail').value.trim();
+  if(!email){msg.textContent='Email required';msg.style.color='#dc2626';return;}
+  const capabilities=[].slice.call(document.querySelectorAll('#nvCaps input[type=checkbox]')).filter(function(c){return c.checked;}).map(function(c){return c.getAttribute('data-cap');});
+  const body={
+    email:email,contact:document.getElementById('nvName').value.trim(),
+    phone:document.getElementById('nvPhone').value.trim(),
+    maxConcurrent:document.getElementById('nvMax').value,
+    active:document.getElementById('nvActive').checked,
+    capabilities:capabilities,tempPassword:document.getElementById('nvPw').value.trim()
+  };
+  msg.textContent='Creating\u2026';msg.style.color='#64748b';
+  try{
+    const r=await fetch('/vendor/api/admin/create-vendor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json();
+    if(!d.ok){msg.textContent='Error: '+(d.error||'failed');msg.style.color='#dc2626';return;}
+    msg.textContent='Vendor created'+(d.loginCreated?' with login':'')+' \u2713';msg.style.color='#16a34a';
+    ['nvName','nvEmail','nvPhone','nvPw'].forEach(function(id){document.getElementById(id).value='';});
+    document.querySelectorAll('#nvCaps input').forEach(function(c){c.checked=false;});
+    load();
+  }catch(e){msg.textContent='Error creating';msg.style.color='#dc2626';}
+}
 async function load(){
   const r=await fetch('/vendor/api/admin/vendors');const v=await r.json();
   list.innerHTML=v.map(x=>'<div class=card><div><b>'+x.name+'</b><div class=tag>'+x.email+'</div></div><div>'+
