@@ -496,7 +496,7 @@ function mountVendorPortal(app, deps) {
       const editsByVendor = {};
       openEdits.forEach((e) => { const a = String(e.Assigned_Artist || "").toLowerCase(); if (a) editsByVendor[a] = (editsByVendor[a] || 0) + 1; });
       const orders = pending.map((o) => ({
-        id: o._id, orderNo: o["Order#"] || "", type: o.Order_Type || "",
+        id: o._id, orderNo: o["Order#"] || "", ref: o["Customer_PO#"] || "", type: o.Order_Type || "",
         user: o.User || "", assigned: String(o[F.assignedArtist] || ""),
         state: o[F.claimState] || "",
         ageHours: o["Created Date"] ? +(((now - new Date(o["Created Date"]).getTime()) / 3600000).toFixed(2)) : null,
@@ -511,6 +511,7 @@ function mountVendorPortal(app, deps) {
         orderSpeedToday: a.daily_timer, orderSpeedMonth: a.monthly_timer, editSpeedMonth: a.monthly_edit_timer,
         editPctToday: a["Edit Percentage Today"], editPctMonth: a["Edit Percentage Month"],
       })).sort((x, y) => (x.email > y.email ? 1 : -1));
+      const knownTypes = ["Vector", "Digitizing", "Digital (DTF/DTG)"];
       const totals = {
         pending: pending.length,
         unassigned: pending.filter((o) => !o[F.assignedArtist]).length,
@@ -518,7 +519,20 @@ function mountVendorPortal(app, deps) {
         vector: pending.filter((o) => o.Order_Type === "Vector").length,
         digitizing: pending.filter((o) => o.Order_Type === "Digitizing").length,
         digital: pending.filter((o) => o.Order_Type === "Digital (DTF/DTG)").length,
+        other: pending.filter((o) => !knownTypes.includes(o.Order_Type)).length,
       };
+      // Today's throughput (computed, fail-safe — a date-constraint failure won't break the page).
+      const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0); const iso = dayStart.toISOString();
+      try {
+        const done = await search("uploaded_image", [
+          { key: F.claimState, constraint_type: "equals", value: "completed" },
+          { key: "Modified Date", constraint_type: "greater than", value: iso }]);
+        totals.completedToday = done.length;
+      } catch (e) { console.warn("[dashboard] completedToday failed:", e.message); totals.completedToday = null; }
+      try {
+        const et = await search("edit_request", [{ key: "Completed", constraint_type: "greater than", value: iso }]);
+        totals.editsToday = et.length;
+      } catch (e) { console.warn("[dashboard] editsToday failed:", e.message); totals.editsToday = null; }
       const vendors = artists.filter((a) => a.is_active_vendor === true)
         .map((a) => String(a.email || "").toLowerCase()).filter(Boolean).sort();
       res.json({ totals, artists: artistRows, orders, vendors });
@@ -700,52 +714,79 @@ const ADMIN_ORDERS_HTML = `<!doctype html><html><head><meta charset=utf8><meta n
 body{font-family:system-ui,sans-serif;background:#f4f6fa;margin:0;color:#0f172a}
 header{background:#0f172a;color:#fff;padding:14px 20px;display:flex;justify-content:space-between;align-items:center}
 header a{color:#93c5fd;text-decoration:none;margin-left:14px;font-size:14px}
-.wrap{max-width:1200px;margin:18px auto;padding:0 16px}
-.totals{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:16px}
-.tcard{background:#fff;border-radius:10px;padding:12px 16px;box-shadow:0 1px 3px rgba(0,0,0,.08);min-width:120px}
+.wrap{max-width:1280px;margin:18px auto;padding:0 16px}
+.tabs{display:flex;gap:6px;margin-bottom:18px}
+.tab{background:#e2e8f0;color:#334155;border:0;border-radius:8px 8px 0 0;padding:10px 20px;font-weight:700;cursor:pointer;font-size:14px}
+.tab.active{background:#fff;color:#0f172a;box-shadow:0 -2px 0 #2563eb inset}
+.stat-group{margin-bottom:8px;font-size:12px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.04em}
+.totals{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:18px}
+.tcard{background:#fff;border-radius:10px;padding:12px 16px;box-shadow:0 1px 3px rgba(0,0,0,.08);min-width:110px}
 .tcard .n{font-size:22px;font-weight:800}.tcard .l{font-size:12px;color:#64748b}
-.t-warn .n{color:#dc2626}
-.sec{font-size:14px;color:#475569;font-weight:700;margin:18px 0 10px}
+.t-warn .n{color:#dc2626}.t-day{background:#0f172a}.t-day .n{color:#fff}.t-day .l{color:#94a3b8}
 .statwrap{overflow-x:auto}
 table.stats{border-collapse:collapse;width:100%;background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.08);font-size:13px}
 table.stats th,table.stats td{padding:8px 10px;border-bottom:1px solid #eef2f6;text-align:center;white-space:nowrap}
 table.stats th{background:#f1f5f9;color:#334155;font-weight:700}
 table.stats td.vn,table.stats th.vn{text-align:left}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}.on{background:#16a34a}.off{background:#cbd5e1}
-.ocard{background:#fff;border-radius:10px;padding:14px;margin-bottom:10px;box-shadow:0 1px 3px rgba(0,0,0,.06)}
-.ohead{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
-.ono{font-weight:700}.osub{color:#64748b;font-size:13px}
-.age{font-weight:700;font-size:13px}.a-green{color:#16a34a}.a-orange{color:#d97706}.a-red{color:#dc2626}
-.oact{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px}
-select,input{padding:6px 8px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px}
-button{border:0;border-radius:8px;padding:7px 12px;font-weight:600;cursor:pointer;font-size:13px}
+.osub{color:#64748b;font-size:12px}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+@media(max-width:900px){.grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:600px){.grid{grid-template-columns:1fr}}
+.ocard{background:#fff;border-radius:10px;padding:14px;box-shadow:0 1px 3px rgba(0,0,0,.07);border-left:5px solid #cbd5e1}
+.ocard.age-green{border-left-color:#16a34a}.ocard.age-orange{border-left-color:#d97706}.ocard.age-red{border-left-color:#dc2626}
+.ono{font-weight:700;font-size:15px}.age{font-weight:800;font-size:13px;float:right}
+.age-green .age,.g{color:#16a34a}.age-orange .age,.o{color:#d97706}.age-red .age,.r{color:#dc2626}
+.line{font-size:13px;color:#475569;margin-top:3px}.line b{color:#0f172a}
+.badge{display:inline-block;font-size:10px;font-weight:700;padding:2px 7px;border-radius:999px;margin-right:5px}
+.b-un{background:#fef3c7;color:#92400e}.b-rush{background:#fee2e2;color:#b91c1c}.b-sep{background:#e0e7ff;color:#3730a3}.b-state{background:#f1f5f9;color:#475569}
+.oact{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:12px}
+select,input{padding:6px 7px;border:1px solid #cbd5e1;border-radius:6px;font-size:12px}
+button{border:0;border-radius:8px;padding:6px 11px;font-weight:600;cursor:pointer;font-size:12px}
 .assign{background:#2563eb;color:#fff}.cancel{background:#fee2e2;color:#b91c1c}.logout{background:rgba(255,255,255,.2);color:#fff}
-.badge{display:inline-block;font-size:11px;font-weight:700;padding:2px 7px;border-radius:999px;margin-left:6px}
-.b-un{background:#fef3c7;color:#92400e}.b-rush{background:#fee2e2;color:#b91c1c}.b-sep{background:#e0e7ff;color:#3730a3}
-.msg{font-size:12px;margin-left:6px}
+.msg{font-size:11px;margin-left:4px}
 </style></head><body>
 <header><div><b>Orders Dashboard</b><a href="/vendor/admin">Vendor logins</a><a href="/vendor/admin/controls">Vendor controls</a></div>
 <button class=logout onclick="logout()">Log out</button></header>
 <div class=wrap>
-<div id=totals class=totals></div>
-<div class=sec>By vendor (stored metrics)</div><div class=statwrap><div id=stats></div></div>
-<div class=sec>All pending orders <span id=ocount class=osub></span></div><div id=orders></div>
+<div class=tabs><button class="tab active" id=tabOrders onclick="showTab('orders')">Orders</button><button class=tab id=tabVendors onclick="showTab('vendors')">By Vendor</button></div>
+<div id=paneOrders>
+  <div class=stat-group>Current</div>
+  <div id=totalsCur class=totals></div>
+  <div class=stat-group>Today</div>
+  <div id=totalsDay class=totals></div>
+  <div class=stat-group>Pending orders &mdash; oldest first <span id=ocount class=osub></span></div>
+  <div id=orders class=grid></div>
+</div>
+<div id=paneVendors style=display:none>
+  <div class=stat-group>Vendor-level data (stored metrics)</div>
+  <div class=statwrap><div id=stats></div></div>
+</div>
 </div>
 <script>
 let DATA={vendors:[]};
-function ageClass(h){if(h==null)return '';if(h>8)return 'a-red';if(h>=6)return 'a-orange';return 'a-green';}
+function showTab(t){
+  document.getElementById('paneOrders').style.display=t==='orders'?'block':'none';
+  document.getElementById('paneVendors').style.display=t==='vendors'?'block':'none';
+  document.getElementById('tabOrders').classList.toggle('active',t==='orders');
+  document.getElementById('tabVendors').classList.toggle('active',t==='vendors');
+}
+function ageClass(h){if(h==null)return '';if(h>8)return 'age-red';if(h>=6)return 'age-orange';return 'age-green';}
 async function load(){
   try{const r=await fetch('/vendor/api/admin/dashboard');DATA=await r.json();render();}
   catch(e){document.getElementById('orders').textContent='Failed to load dashboard.';}
 }
+function tcard(n,l,cls){return '<div class="tcard'+(cls?' '+cls:'')+'"><div class=n>'+(n==null?'\u2013':n)+'</div><div class=l>'+l+'</div></div>';}
 function render(){
   const t=DATA.totals||{};
-  document.getElementById('totals').innerHTML=
-    tcard(t.pending,'Pending orders')+tcard(t.unassigned,'Unassigned',true)+tcard(t.openEdits,'Open edits')+
-    tcard(t.vector,'Vector')+tcard(t.digitizing,'Digitizing')+tcard(t.digital,'Digital (DTF/DTG)');
+  document.getElementById('totalsCur').innerHTML=
+    tcard(t.pending,'Pending')+tcard(t.unassigned,'Unassigned',t.unassigned?'t-warn':'')+tcard(t.openEdits,'Open edits')+
+    tcard(t.vector,'Vector')+tcard(t.digitizing,'Digitizing')+tcard(t.digital,'Digital (DTF/DTG)')+
+    tcard(t.other,'Other / unknown',t.other?'t-warn':'');
+  document.getElementById('totalsDay').innerHTML=
+    tcard(t.completedToday,'Orders completed today','t-day')+tcard(t.editsToday,'Edits completed today','t-day');
   renderStats();renderOrders();
 }
-function tcard(n,l,warn){return '<div class="tcard'+(warn&&n?' t-warn':'')+'"><div class=n>'+(n==null?'0':n)+'</div><div class=l>'+l+'</div></div>';}
 function renderStats(){
   const a=DATA.artists||[];
   if(!a.length){document.getElementById('stats').textContent='No vendors.';return;}
@@ -756,7 +797,7 @@ function renderStats(){
   let h='<table class=stats><tr><th class=vn>Vendor</th>';cols.forEach(function(c){h+='<th>'+c[1]+'</th>';});h+='</tr>';
   a.forEach(function(v){
     h+='<tr><td class=vn><span class="dot '+(v.active?'on':'off')+'"></span>'+(v.contact||v.email||'(no email)')+'<div class=osub>'+(v.email||'')+'</div></td>';
-    cols.forEach(function(c){var val=v[c[0]];h+='<td>'+(val==null||val===''?'–':val)+'</td>';});
+    cols.forEach(function(c){var val=v[c[0]];h+='<td>'+(val==null||val===''?'\u2013':val)+'</td>';});
     h+='</tr>';
   });
   h+='</table>';document.getElementById('stats').innerHTML=h;
@@ -767,18 +808,21 @@ function renderOrders(){
   if(!o.length){document.getElementById('orders').innerHTML='<div class=osub>No pending orders.</div>';return;}
   const opts=(DATA.vendors||[]).map(function(e){return '<option value="'+e+'">'+e+'</option>';}).join('');
   document.getElementById('orders').innerHTML=o.map(function(x){
-    const assigned=x.assigned?('Artist: '+x.assigned):'<span class="badge b-un">UNASSIGNED</span>';
-    const badges=(x.rush==='yes'?'<span class="badge b-rush">RUSH</span>':'')+(x.separations==='yes'?'<span class="badge b-sep">SEPS</span>':'');
-    const age=x.ageHours==null?'':'<span class="age '+ageClass(x.ageHours)+'">Age: '+x.ageHours+'h</span>';
-    return '<div class=ocard data-id="'+x.id+'"><div class=ohead>'+
-      '<div><div class=ono>Order # '+(x.orderNo||x.id)+' '+badges+'</div>'+
-      '<div class=osub>'+(x.type||'')+' &middot; User: '+(x.user||'?')+'</div>'+
-      '<div class=osub>'+assigned+'</div></div><div>'+age+'</div></div>'+
-      '<div class=oact><select class=vsel>'+(x.assigned?'':'<option value="">choose vendor…</option>')+opts+'</select>'+
+    const agec=ageClass(x.ageHours);
+    const assigned=x.assigned?('<b>Artist:</b> '+x.assigned):'<span class="badge b-un">UNASSIGNED</span>';
+    const badges=(x.rush==='yes'?'<span class="badge b-rush">RUSH</span>':'')+(x.separations==='yes'?'<span class="badge b-sep">SEPS</span>':'')+(x.state?'<span class="badge b-state">'+x.state+'</span>':'');
+    const age=x.ageHours==null?'':'<span class=age>'+x.ageHours+'h</span>';
+    return '<div class="ocard '+agec+'" data-id="'+x.id+'">'+age+
+      '<div class=ono>Order # '+(x.orderNo||x.id)+'</div>'+
+      '<div class=line>'+(x.type||'(no type)')+'</div>'+
+      (x.ref?'<div class=line><b>PO:</b> '+x.ref+'</div>':'')+
+      '<div class=line><b>Client:</b> '+(x.user||'?')+'</div>'+
+      '<div class=line>'+assigned+'</div>'+
+      '<div style=margin-top:8px>'+badges+'</div>'+
+      '<div class=oact><select class=vsel>'+(x.assigned?'':'<option value="">choose vendor\u2026</option>')+opts+'</select>'+
       '<button class=assign>'+(x.assigned?'Reassign':'Push')+'</button>'+
       '<button class=cancel>Cancel</button><span class=msg></span></div></div>';
   }).join('');
-  // preselect current assignee
   o.forEach(function(x){if(x.assigned){const sel=document.querySelector('.ocard[data-id="'+x.id+'"] .vsel');if(sel)sel.value=x.assigned;}});
   document.getElementById('orders').addEventListener('click',onAction);
 }
@@ -788,12 +832,12 @@ async function onAction(e){
   if(e.target.classList.contains('assign')){
     const email=card.querySelector('.vsel').value;
     if(!email){msg.textContent='Pick a vendor';msg.style.color='#dc2626';return;}
-    msg.textContent='Assigning…';msg.style.color='#64748b';
-    await post('/vendor/api/admin/assign-order',{id:id,email:email},msg,'Assigned ✓');
+    msg.textContent='Assigning\u2026';msg.style.color='#64748b';
+    await post('/vendor/api/admin/assign-order',{id:id,email:email},msg,'Assigned \u2713');
   }else if(e.target.classList.contains('cancel')){
     if(!confirm('Cancel this order? It will stop rotating and leave all queues.'))return;
-    msg.textContent='Cancelling…';msg.style.color='#64748b';
-    await post('/vendor/api/admin/cancel-order',{id:id},msg,'Cancelled ✓');
+    msg.textContent='Cancelling\u2026';msg.style.color='#64748b';
+    await post('/vendor/api/admin/cancel-order',{id:id},msg,'Cancelled \u2713');
   }
 }
 async function post(url,body,msg,okText){
