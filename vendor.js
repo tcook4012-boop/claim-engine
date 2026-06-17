@@ -159,7 +159,8 @@ function mountVendorPortal(app, deps) {
       const t = await bubble("GET", `/team/${teamId}`).then(r => r.response);
       [["Template 1", t.Client_Template_1], ["Template 2", t.Client_Template_2], ["Template 3", t.Client_Template_3]]
         .forEach(([label, val]) => { const u = linkify(val); if (u) docs.templates.push({ label, url: u }); });
-      docs.instructions = t.Client_Special_Instructions || "";
+      docs.instructions = [t.Client_Special_Instructions_1, t.Client_Special_Instructions_2]
+        .filter((s) => s && String(s).trim()).join("\n\n");
     } catch (e) { console.warn("[teamDocs] lookup failed for team " + teamId + ":", e.message); }
     if (cache) cache.set(teamId, docs);
     return docs;
