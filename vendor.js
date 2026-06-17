@@ -165,25 +165,6 @@ function mountVendorPortal(app, deps) {
     return docs;
   }
 
-  // Find the OPEN edit request (blank Completed) for an order, by Order#. FAIL-SAFE:
-  // returns null on any error so the card still renders. Keys confirmed from raw JSON.
-  async function openEditDetail(orderNo) {
-    if (!orderNo) return null;
-    const linkify = (v) => (!v ? null : (String(v).startsWith("//") ? "https:" + v : String(v)));
-    try {
-      const reqs = await search("edit_request", [
-        { key: "Order#", constraint_type: "equals", value: orderNo },
-        { key: "Completed", constraint_type: "is_empty" }]);
-      if (!reqs.length) return null;
-      // If more than one is open, take the most recently created.
-      const r = reqs.sort((a, b) => new Date(b["Created Date"]) - new Date(a["Created Date"]))[0];
-      const refs = [["Reference 1", r.File_1], ["Reference 2", r.File_2]]
-        .map(([label, v]) => { const u = linkify(v); return u ? { label, url: u } : null; })
-        .filter(Boolean);
-      return { reqId: r._id, changes: r.Changes_Needed || "", reason: r.Edit_Reason || "", created: r["Created Date"] || null, refs };
-    } catch (e) { console.warn("[openEditDetail] lookup failed for " + orderNo + ":", e.message); return null; }
-  }
-
   function orderView(o, team) {
     const thumb = o.image ? (String(o.image).startsWith("//") ? "https:" + o.image : String(o.image)) : "";
     const v = {
@@ -221,23 +202,45 @@ function mountVendorPortal(app, deps) {
       const mine = await search("uploaded_image", [
         { key: F.assignedArtist, constraint_type: "equals", value: email },
         { key: F.claimState, constraint_type: "equals", value: CS.claimed }]);
-      // Edit requests: orders flagged Edit_Requested == yes that this vendor completed.
-      // The original work stays on the order; the open Edit_Request record carries the detail.
-      const editFlagged = await search("uploaded_image", [
-        { key: "Edit_Requested", constraint_type: "equals", value: true },
-        { key: F.assignedArtist, constraint_type: "equals", value: email }]);
-      // Cap gate is regular claimed work only; edit requests ride on top, off-cap.
-      const underLimit = mine.length < limit;
       const teamCache = new Map();
       const claimedViews = await Promise.all(mine.map(async (o) =>
         orderView(o, await teamDocs(o.Team_Name, teamCache))));
-      const editViews = await Promise.all(editFlagged.map(async (o) => {
-        const v = orderView(o, await teamDocs(o.Team_Name, teamCache));
-        v.edit = await openEditDetail(o["Order#"]);
-        return v;
+      // Edit requests: OPEN Edit_Request records (blank Completed) assigned to this vendor.
+      // The table is the source of truth; we join to the order by Order# for original work.
+      const linkify = (v) => (!v ? null : (String(v).startsWith("//") ? "https:" + v : String(v)));
+      let openEdits = [];
+      try {
+        openEdits = await search("edit_request", [
+          { key: "Assigned_Artist", constraint_type: "equals", value: email },
+          { key: "Completed", constraint_type: "is_empty" }]);
+      } catch (e) { console.warn("[orders] edit_request lookup failed:", e.message); }
+      // Cap load = claimed work + open edits (matches the engine's countClaimed). Open
+      // edits consume slots so a vendor can't take new work until edits are cleared.
+      const editCount = openEdits.length;
+      const load = mine.length + editCount;
+      const underLimit = load < limit;
+      const editViews = await Promise.all(openEdits.map(async (er) => {
+        let order = null;
+        try {
+          const m = await search("uploaded_image", [{ key: "Order#", constraint_type: "equals", value: er["Order#"] }]);
+          order = m[0] || null;
+        } catch (e) { console.warn("[orders] order lookup failed for " + er["Order#"] + ":", e.message); }
+        const base = order
+          ? orderView(order, await teamDocs(order.Team_Name, teamCache))
+          : { id: null, ref: "", orderNo: er["Order#"] || "", type: er.Order_Type || "", thumb: "", files: [], separations: "no", rush: "no", specialInstructions: "" };
+        base.id = order ? order._id : null; // "Upload revised" must target the ORDER
+        base.edit = {
+          reqId: er._id,
+          changes: er.Changes_Needed || "",
+          reason: er.Edit_Reason || "",
+          created: er["Created Date"] || null,
+          refs: [["Reference 1", er.File_1], ["Reference 2", er.File_2]]
+            .map(([label, v]) => { const u = linkify(v); return u ? { label, url: u } : null; }).filter(Boolean),
+        };
+        return base;
       }));
       res.json({
-        email, limit, openCount: mine.length, underLimit,
+        email, limit, openCount: load, claimedCount: mine.length, editCount, underLimit,
         actingAs: req.session.actingAs || null,
         edits: editViews,
         claimable: claimable.map((o) => orderView(o)),
@@ -292,11 +295,18 @@ function mountVendorPortal(app, deps) {
       const email = effectiveEmail(req.session);
       const orderId = req.body.orderId;
 
-      // Verify this order belongs to this vendor and is either claimed work or an edit.
+      // Verify this order belongs to this vendor; allow either claimed work or an open edit.
       const o = await getOrder(orderId);
       if (!o) return res.status(404).json({ ok: false, error: "Order not found" });
       if (o[F.assignedArtist] !== email) return res.status(403).json({ ok: false, error: "Not your order" });
-      const isEditSubmit = o.Edit_Requested === true;
+      // Open edit request for this order assigned to this vendor? (table is source of truth)
+      let openEditReqs = [];
+      try {
+        openEditReqs = await search("edit_request", [
+          { key: "Order#", constraint_type: "equals", value: o["Order#"] },
+          { key: "Completed", constraint_type: "is_empty" }]);
+      } catch (e) { console.warn("[upload] edit lookup failed:", e.message); }
+      const isEditSubmit = openEditReqs.length > 0;
       if (o[F.claimState] !== CS.claimed && !isEditSubmit)
         return res.status(400).json({ ok: false, error: "Order is not in your claimed list" });
 
@@ -347,18 +357,15 @@ function mountVendorPortal(app, deps) {
       // back to false (in patch above) and writes the revised files onto the order.
       await patchOrder(orderId, patch);
 
-      // Edit submit: stamp the open Edit_Request record Completed = now so it drops out
-      // of the vendor's edit queue and into history. Best-effort: a failure here doesn't
+      // Edit submit: stamp the open Edit_Request record(s) Completed = now so they drop
+      // out of the vendor's edit queue into history. Best-effort: a failure here doesn't
       // undo the fix already written to the order.
       if (isEditSubmit) {
         try {
-          const reqs = await search("edit_request", [
-            { key: "Order#", constraint_type: "equals", value: o["Order#"] },
-            { key: "Completed", constraint_type: "is_empty" }]);
-          for (const r of reqs) {
+          for (const r of openEditReqs) {
             await bubble("PATCH", `/edit_request/${r._id}`, { Completed: Date.now() });
           }
-          console.log(`[edit] order ${o["Order#"]} revised by ${email}; ${reqs.length} edit record(s) marked complete`);
+          console.log(`[edit] order ${o["Order#"]} revised by ${email}; ${openEditReqs.length} edit record(s) marked complete`);
         } catch (e) { console.warn("[upload] edit-record close failed:", e.message); }
       }
 
@@ -515,7 +522,7 @@ async function load(){
   if(r.status===302||r.redirected){location.href='/vendor/login';return;}
   data=await r.json();
   if(data.actingAs){banner.style.display='block';banner.innerHTML='Viewing as '+data.actingAs+' — <a href="#" onclick="stopRunAs();return false">exit</a>';}
-  limit.textContent='Limit: '+data.openCount+' / '+data.limit+' claimed'+(data.underLimit?'':' — at limit, finish work to claim more');
+  limit.textContent='Limit: '+data.openCount+' / '+data.limit+(data.editCount?' ('+data.claimedCount+' claimed + '+data.editCount+' edit'+(data.editCount>1?'s':'')+')':'')+(data.underLimit?'':' — at limit, clear work to take more');
   claimable.innerHTML=data.claimable.length?data.claimable.map(card).join(''):'<div class=muted>Nothing to claim right now.</div>';
   claimed.innerHTML=data.claimed.length?data.claimed.map(c=>card(c,true)).join(''):'<div class=muted>No claimed orders.</div>';
   if(data.edits&&data.edits.length){editsWrap.style.display='block';edits.innerHTML=data.edits.map(c=>card(c,true,true)).join('');}
@@ -526,6 +533,7 @@ function card(o,claimed,isEdit){
   const sep=(!claimed&&o.separations==='yes')?'<span class=sep>SEPARATIONS</span> ':'';
   let action='';
   if(!claimed){action=data.underLimit?'<button class=claim onclick="claim(\\''+o.id+'\\')">Claim</button>':'<span class=tag>at limit</span>';}
+  else if(isEdit&&!o.id){action='<span class=tag>original order not found</span>';}
   else{action='<button class=upload onclick="openUpload(\\''+o.id+'\\')">'+(isEdit?'Upload revised':'Upload completed')+'</button>';}
   let rich='';
   if(claimed){
