@@ -144,7 +144,6 @@ function mountVendorPortal(app, deps) {
       out.push({ label, url });
     };
     push("Artwork", o.image);
-    push("Optimized", o.Optimized_Image);
     if (Array.isArray(o.Supporting_Files)) o.Supporting_Files.forEach((f, i) => push(`Supporting ${i + 1}`, f));
     return out;
   }
@@ -448,7 +447,7 @@ button{padding:8px 14px;border:0;border-radius:8px;cursor:pointer;font-size:14px
 .cdetails{display:flex;gap:12px;margin-top:10px;align-items:flex-start}.cmeta{flex:1;min-width:0}
 .badge{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;margin:0 5px 5px 0;letter-spacing:.02em}
 .b-type{background:#eef2ff;color:#3730a3}.b-rush{background:#fee2e2;color:#b91c1c}.b-sep{background:#fef3c7;color:#92400e}
-.timer{font-size:12px;color:#475569;margin:2px 0 4px}
+.timer{font-size:12px;margin:2px 0 4px;font-weight:600}.t-green{color:#16a34a}.t-orange{color:#d97706}.t-red{color:#dc2626;font-weight:700}
 .notes{font-size:13px;color:#334155;background:#f8fafc;border-left:3px solid #cbd5e1;padding:6px 10px;border-radius:4px;margin-top:8px;white-space:pre-wrap}
 .tmpl{margin-top:8px}.tmpl .link{background:#dbeafe;color:#1e40af}.tmpl-label{font-size:12px;color:#64748b;font-weight:700;margin-bottom:3px}
 </style></head><body>
@@ -481,7 +480,7 @@ function card(o,claimed){
       (o.rush==='yes'?'<span class="badge b-rush">RUSH</span>':'')+
       (o.separations==='yes'?'<span class="badge b-sep">SEPARATIONS</span>':'');
     const thumb=o.thumb?'<img class=thumb src="'+o.thumb+'" alt="artwork" onerror="this.style.display=\\'none\\'">':'';
-    const timer=o.claimedAt?'<div class=timer data-since="'+o.claimedAt+'">\\u23F1 claimed '+fmtElapsed(o.claimedAt)+' ago</div>':'';
+    const timer=o.claimedAt?'<div class="timer '+timerClass(o.claimedAt)+'" data-since="'+o.claimedAt+'">\\u23F1 claimed '+fmtElapsed(o.claimedAt)+' ago</div>':'';
     const notes=o.specialInstructions?'<div class=notes><b>Special instructions:</b> '+esc(o.specialInstructions)+'</div>':'';
     let tmpl='';
     if(o.team){
@@ -530,6 +529,14 @@ function fmtElapsed(since){
   if(m>0)return m+'m';
   return 'just now';
 }
+function timerClass(since){
+  if(!since)return 't-green';
+  var h=(Date.now()-new Date(since).getTime())/3600000;
+  if(isNaN(h))return 't-green';
+  if(h>8)return 't-red';
+  if(h>=6)return 't-orange';
+  return 't-green';
+}
 function openUpload(id){const b=document.getElementById('up'+id);b.style.display=b.style.display==='none'?'block':'none';}
 async function claim(id){
   const r=await fetch('/vendor/api/claim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({orderId:id})});
@@ -561,7 +568,9 @@ async function stopRunAs(){await fetch('/vendor/api/admin/stop-run-as',{method:'
 function anyUploadOpen(){return [...document.querySelectorAll('.uploadbox')].some(el=>el.style.display==='block');}
 setInterval(function(){
   document.querySelectorAll('.timer[data-since]').forEach(function(el){
-    el.textContent='\\u23F1 claimed '+fmtElapsed(el.getAttribute('data-since'))+' ago';
+    var s=el.getAttribute('data-since');
+    el.className='timer '+timerClass(s);
+    el.textContent='\\u23F1 claimed '+fmtElapsed(s)+' ago';
   });
 },1000);
 load();
