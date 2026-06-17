@@ -495,13 +495,22 @@ function mountVendorPortal(app, deps) {
       const now = Date.now();
       const editsByVendor = {};
       openEdits.forEach((e) => { const a = String(e.Assigned_Artist || "").toLowerCase(); if (a) editsByVendor[a] = (editsByVendor[a] || 0) + 1; });
-      const orders = pending.map((o) => ({
-        id: o._id, orderNo: o["Order#"] || "", ref: o["Customer_PO#"] || "", type: o.Order_Type || "",
-        user: o.User || "", assigned: String(o[F.assignedArtist] || ""),
-        state: o[F.claimState] || "",
-        ageHours: o["Created Date"] ? +(((now - new Date(o["Created Date"]).getTime()) / 3600000).toFixed(2)) : null,
-        separations: o[F.separations] || "no", rush: o.Rush || "no",
-      })).sort((a, b) => (b.ageHours || 0) - (a.ageHours || 0));
+      const orders = pending.map((o) => {
+        const created = o["Created Date"] ? (now - new Date(o["Created Date"]).getTime()) / 3600000 : null;
+        const claimed = o.claimed_at ? (now - new Date(o.claimed_at).getTime()) / 3600000 : null;
+        return {
+          id: o._id, orderNo: o["Order#"] || "", ref: o["Customer_PO#"] || "", type: o.Order_Type || "",
+          user: o.User || "", assigned: String(o[F.assignedArtist] || ""), state: o[F.claimState] || "",
+          createdHours: created != null ? +created.toFixed(2) : null,
+          claimedHours: claimed != null ? +claimed.toFixed(2) : null,
+          separations: o[F.separations] || "no", rush: o.Rush || "no",
+        };
+      }).sort((a, b) => {
+        // Longest-held claimed work first (the actionable SLA clock); then unclaimed by oldest created.
+        const av = a.claimedHours != null ? a.claimedHours : -1, bv = b.claimedHours != null ? b.claimedHours : -1;
+        if (av !== bv) return bv - av;
+        return (b.createdHours || 0) - (a.createdHours || 0);
+      });
       const artistRows = artists.map((a) => ({
         email: String(a.email || "").toLowerCase(), contact: a.contact || "", active: a.is_active_vendor === true,
         cap: a.max_concurrent_orders, openEditsNow: editsByVendor[String(a.email || "").toLowerCase()] || 0,
@@ -512,17 +521,21 @@ function mountVendorPortal(app, deps) {
         editPctToday: a["Edit Percentage Today"], editPctMonth: a["Edit Percentage Month"],
       })).sort((x, y) => (x.email > y.email ? 1 : -1));
       const knownTypes = ["Vector", "Digitizing", "Digital (DTF/DTG)"];
+      const hSinceClaim = (o) => o.claimed_at ? (now - new Date(o.claimed_at).getTime()) / 3600000 : null;
       const totals = {
         pending: pending.length,
         unassigned: pending.filter((o) => !o[F.assignedArtist]).length,
         openEdits: openEdits.length,
+        aging: pending.filter((o) => { const h = hSinceClaim(o); return h != null && h > 8; }).length,
+        multiEdit: pending.filter((o) => o["Multiple Edit Alert"] === true).length,
         vector: pending.filter((o) => o.Order_Type === "Vector").length,
         digitizing: pending.filter((o) => o.Order_Type === "Digitizing").length,
         digital: pending.filter((o) => o.Order_Type === "Digital (DTF/DTG)").length,
         other: pending.filter((o) => !knownTypes.includes(o.Order_Type)).length,
       };
-      // Today's throughput (computed, fail-safe — a date-constraint failure won't break the page).
+      // Today's + this month's throughput (computed, fail-safe — a date-constraint failure won't break the page).
       const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0); const iso = dayStart.toISOString();
+      const monStart = new Date(); monStart.setDate(1); monStart.setHours(0, 0, 0, 0); const monIso = monStart.toISOString();
       try {
         const done = await search("uploaded_image", [
           { key: F.claimState, constraint_type: "equals", value: "completed" },
@@ -533,6 +546,12 @@ function mountVendorPortal(app, deps) {
         const et = await search("edit_request", [{ key: "Completed", constraint_type: "greater than", value: iso }]);
         totals.editsToday = et.length;
       } catch (e) { console.warn("[dashboard] editsToday failed:", e.message); totals.editsToday = null; }
+      try {
+        const mo = await search("uploaded_image", [
+          { key: F.claimState, constraint_type: "equals", value: "completed" },
+          { key: "Modified Date", constraint_type: "greater than", value: monIso }]);
+        totals.completedMonth = mo.length;
+      } catch (e) { console.warn("[dashboard] completedMonth failed:", e.message); totals.completedMonth = null; }
       const vendors = artists.filter((a) => a.is_active_vendor === true)
         .map((a) => String(a.email || "").toLowerCase()).filter(Boolean).sort();
       res.json({ totals, artists: artistRows, orders, vendors });
@@ -719,6 +738,11 @@ header a{color:#93c5fd;text-decoration:none;margin-left:14px;font-size:14px}
 .tab{background:#e2e8f0;color:#334155;border:0;border-radius:8px 8px 0 0;padding:10px 20px;font-weight:700;cursor:pointer;font-size:14px}
 .tab.active{background:#fff;color:#0f172a;box-shadow:0 -2px 0 #2563eb inset}
 .stat-group{margin-bottom:8px;font-size:12px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.04em}
+.totalpanel{background:#fff;border-radius:12px;padding:18px 22px;box-shadow:0 1px 3px rgba(0,0,0,.08);margin-bottom:18px;max-width:380px}
+.totalpanel h3{color:#2563eb;margin:0 0 10px;font-size:20px}
+.totalpanel .row{font-size:17px;font-weight:700;margin:6px 0}
+.totalpanel .row span{font-weight:800}
+.tp-red{color:#dc2626}.tp-orange{color:#d97706}
 .totals{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:18px}
 .tcard{background:#fff;border-radius:10px;padding:12px 16px;box-shadow:0 1px 3px rgba(0,0,0,.08);min-width:110px}
 .tcard .n{font-size:22px;font-weight:800}.tcard .l{font-size:12px;color:#64748b}
@@ -736,6 +760,8 @@ table.stats td.vn,table.stats th.vn{text-align:left}
 .ocard{background:#fff;border-radius:10px;padding:14px;box-shadow:0 1px 3px rgba(0,0,0,.07);border-left:5px solid #cbd5e1}
 .ocard.age-green{border-left-color:#16a34a}.ocard.age-orange{border-left-color:#d97706}.ocard.age-red{border-left-color:#dc2626}
 .ono{font-weight:700;font-size:15px}.age{font-weight:800;font-size:13px;float:right}
+.clocks{display:flex;justify-content:space-between;gap:8px;margin-bottom:6px;flex-wrap:wrap}
+.clk{font-weight:800;font-size:12px}.clk2{font-size:12px;color:#94a3b8}
 .age-green .age,.g{color:#16a34a}.age-orange .age,.o{color:#d97706}.age-red .age,.r{color:#dc2626}
 .line{font-size:13px;color:#475569;margin-top:3px}.line b{color:#0f172a}
 .badge{display:inline-block;font-size:10px;font-weight:700;padding:2px 7px;border-radius:999px;margin-right:5px}
@@ -751,11 +777,10 @@ button{border:0;border-radius:8px;padding:6px 11px;font-weight:600;cursor:pointe
 <div class=wrap>
 <div class=tabs><button class="tab active" id=tabOrders onclick="showTab('orders')">Orders</button><button class=tab id=tabVendors onclick="showTab('vendors')">By Vendor</button></div>
 <div id=paneOrders>
-  <div class=stat-group>Current</div>
-  <div id=totalsCur class=totals></div>
-  <div class=stat-group>Today</div>
-  <div id=totalsDay class=totals></div>
-  <div class=stat-group>Pending orders &mdash; oldest first <span id=ocount class=osub></span></div>
+  <div id=totalPanel class=totalpanel></div>
+  <div class=stat-group>By type</div>
+  <div id=totalsType class=totals></div>
+  <div class=stat-group>Pending orders &mdash; longest-held first <span id=ocount class=osub></span></div>
   <div id=orders class=grid></div>
 </div>
 <div id=paneVendors style=display:none>
@@ -779,14 +804,23 @@ async function load(){
 function tcard(n,l,cls){return '<div class="tcard'+(cls?' '+cls:'')+'"><div class=n>'+(n==null?'\u2013':n)+'</div><div class=l>'+l+'</div></div>';}
 function render(){
   const t=DATA.totals||{};
-  document.getElementById('totalsCur').innerHTML=
-    tcard(t.pending,'Pending')+tcard(t.unassigned,'Unassigned',t.unassigned?'t-warn':'')+tcard(t.openEdits,'Open edits')+
+  const v=function(n){return n==null?'\u2013':n;};
+  document.getElementById('totalPanel').innerHTML=
+    '<h3>Total</h3>'+
+    '<div class=row>Pending Orders: <span>'+v(t.pending)+'</span></div>'+
+    '<div class="row tp-red">Aging Orders: <span>'+v(t.aging)+'</span></div>'+
+    '<div class=row>Edits Pending: <span>'+v(t.openEdits)+'</span></div>'+
+    '<div class="row tp-orange">Multiple Edit Alerts: <span>'+v(t.multiEdit)+'</span></div>'+
+    '<div class=row>Edits Completed Today: <span>'+v(t.editsToday)+'</span></div>'+
+    '<div class=row>Orders Completed Today: <span>'+v(t.completedToday)+'</span></div>'+
+    '<div class=row>Orders Completed This Month: <span>'+v(t.completedMonth)+'</span></div>';
+  document.getElementById('totalsType').innerHTML=
+    tcard(t.unassigned,'Unassigned',t.unassigned?'t-warn':'')+
     tcard(t.vector,'Vector')+tcard(t.digitizing,'Digitizing')+tcard(t.digital,'Digital (DTF/DTG)')+
     tcard(t.other,'Other / unknown',t.other?'t-warn':'');
-  document.getElementById('totalsDay').innerHTML=
-    tcard(t.completedToday,'Orders completed today','t-day')+tcard(t.editsToday,'Edits completed today','t-day');
   renderStats();renderOrders();
 }
+function fmtH(h){if(h==null)return null;if(h>=48)return (h/24).toFixed(1)+'d';return h+'h';}
 function renderStats(){
   const a=DATA.artists||[];
   if(!a.length){document.getElementById('stats').textContent='No vendors.';return;}
@@ -808,11 +842,13 @@ function renderOrders(){
   if(!o.length){document.getElementById('orders').innerHTML='<div class=osub>No pending orders.</div>';return;}
   const opts=(DATA.vendors||[]).map(function(e){return '<option value="'+e+'">'+e+'</option>';}).join('');
   document.getElementById('orders').innerHTML=o.map(function(x){
-    const agec=ageClass(x.ageHours);
+    const agec=ageClass(x.claimedHours);
     const assigned=x.assigned?('<b>Artist:</b> '+x.assigned):'<span class="badge b-un">UNASSIGNED</span>';
     const badges=(x.rush==='yes'?'<span class="badge b-rush">RUSH</span>':'')+(x.separations==='yes'?'<span class="badge b-sep">SEPS</span>':'')+(x.state?'<span class="badge b-state">'+x.state+'</span>':'');
-    const age=x.ageHours==null?'':'<span class=age>'+x.ageHours+'h</span>';
-    return '<div class="ocard '+agec+'" data-id="'+x.id+'">'+age+
+    const claimedTxt=x.claimedHours==null?'not claimed':('claimed '+fmtH(x.claimedHours)+' ago');
+    const createdTxt=x.createdHours==null?'':('created '+fmtH(x.createdHours)+' ago');
+    return '<div class="ocard '+agec+'" data-id="'+x.id+'">'+
+      '<div class=clocks><span class="clk '+agec+'">\u23f1 '+claimedTxt+'</span><span class=clk2>'+createdTxt+'</span></div>'+
       '<div class=ono>Order # '+(x.orderNo||x.id)+'</div>'+
       '<div class=line>'+(x.type||'(no type)')+'</div>'+
       (x.ref?'<div class=line><b>PO:</b> '+x.ref+'</div>':'')+
