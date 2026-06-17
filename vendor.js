@@ -165,6 +165,25 @@ function mountVendorPortal(app, deps) {
     return docs;
   }
 
+  // Find the OPEN edit request (blank Completed) for an order, by Order#. FAIL-SAFE:
+  // returns null on any error so the card still renders. Keys confirmed from raw JSON.
+  async function openEditDetail(orderNo) {
+    if (!orderNo) return null;
+    const linkify = (v) => (!v ? null : (String(v).startsWith("//") ? "https:" + v : String(v)));
+    try {
+      const reqs = await search("edit_request", [
+        { key: "Order#", constraint_type: "equals", value: orderNo },
+        { key: "Completed", constraint_type: "is_empty" }]);
+      if (!reqs.length) return null;
+      // If more than one is open, take the most recently created.
+      const r = reqs.sort((a, b) => new Date(b["Created Date"]) - new Date(a["Created Date"]))[0];
+      const refs = [["Reference 1", r.File_1], ["Reference 2", r.File_2]]
+        .map(([label, v]) => { const u = linkify(v); return u ? { label, url: u } : null; })
+        .filter(Boolean);
+      return { reqId: r._id, changes: r.Changes_Needed || "", reason: r.Edit_Reason || "", created: r["Created Date"] || null, refs };
+    } catch (e) { console.warn("[openEditDetail] lookup failed for " + orderNo + ":", e.message); return null; }
+  }
+
   function orderView(o, team) {
     const thumb = o.image ? (String(o.image).startsWith("//") ? "https:" + o.image : String(o.image)) : "";
     const v = {
@@ -202,13 +221,25 @@ function mountVendorPortal(app, deps) {
       const mine = await search("uploaded_image", [
         { key: F.assignedArtist, constraint_type: "equals", value: email },
         { key: F.claimState, constraint_type: "equals", value: CS.claimed }]);
+      // Edit requests: orders flagged Edit_Requested == yes that this vendor completed.
+      // The original work stays on the order; the open Edit_Request record carries the detail.
+      const editFlagged = await search("uploaded_image", [
+        { key: "Edit_Requested", constraint_type: "equals", value: true },
+        { key: F.assignedArtist, constraint_type: "equals", value: email }]);
+      // Cap gate is regular claimed work only; edit requests ride on top, off-cap.
       const underLimit = mine.length < limit;
       const teamCache = new Map();
       const claimedViews = await Promise.all(mine.map(async (o) =>
         orderView(o, await teamDocs(o.Team_Name, teamCache))));
+      const editViews = await Promise.all(editFlagged.map(async (o) => {
+        const v = orderView(o, await teamDocs(o.Team_Name, teamCache));
+        v.edit = await openEditDetail(o["Order#"]);
+        return v;
+      }));
       res.json({
         email, limit, openCount: mine.length, underLimit,
         actingAs: req.session.actingAs || null,
+        edits: editViews,
         claimable: claimable.map((o) => orderView(o)),
         claimed: claimedViews,
       });
@@ -261,11 +292,13 @@ function mountVendorPortal(app, deps) {
       const email = effectiveEmail(req.session);
       const orderId = req.body.orderId;
 
-      // Verify this order is actually claimed by this vendor.
+      // Verify this order belongs to this vendor and is either claimed work or an edit.
       const o = await getOrder(orderId);
       if (!o) return res.status(404).json({ ok: false, error: "Order not found" });
       if (o[F.assignedArtist] !== email) return res.status(403).json({ ok: false, error: "Not your order" });
-      if (o[F.claimState] !== CS.claimed) return res.status(400).json({ ok: false, error: "Order is not in your claimed list" });
+      const isEditSubmit = o.Edit_Requested === true;
+      if (o[F.claimState] !== CS.claimed && !isEditSubmit)
+        return res.status(400).json({ ok: false, error: "Order is not in your claimed list" });
 
       const previewFile = req.files?.preview?.[0] || null;
       const supportFiles = req.files?.supporting || [];
@@ -310,8 +343,24 @@ function mountVendorPortal(app, deps) {
         usedScratch = true;
       }
 
-      // Final atomic completion write.
+      // Final atomic completion write. Note: on an edit this also flips Edit_Requested
+      // back to false (in patch above) and writes the revised files onto the order.
       await patchOrder(orderId, patch);
+
+      // Edit submit: stamp the open Edit_Request record Completed = now so it drops out
+      // of the vendor's edit queue and into history. Best-effort: a failure here doesn't
+      // undo the fix already written to the order.
+      if (isEditSubmit) {
+        try {
+          const reqs = await search("edit_request", [
+            { key: "Order#", constraint_type: "equals", value: o["Order#"] },
+            { key: "Completed", constraint_type: "is_empty" }]);
+          for (const r of reqs) {
+            await bubble("PATCH", `/edit_request/${r._id}`, { Completed: Date.now() });
+          }
+          console.log(`[edit] order ${o["Order#"]} revised by ${email}; ${reqs.length} edit record(s) marked complete`);
+        } catch (e) { console.warn("[upload] edit-record close failed:", e.message); }
+      }
 
       // Best-effort: blank the scratch pad. It never holds real data, so a lingering
       // value is harmless and gets overwritten on the next upload.
@@ -320,9 +369,9 @@ function mountVendorPortal(app, deps) {
         catch (e) { console.warn("[upload] scratch clear failed:", e.message); }
       }
 
-      await logEvent(orderId, email, "completed_uploaded",
+      await logEvent(orderId, email, isEditSubmit ? "edit_revised" : "completed_uploaded",
         `${previewFile ? "preview" : "no preview"}; ${supportFiles.length} supporting file(s)`);
-      res.json({ ok: true, preview: !!previewFile, supporting: supportFiles.length });
+      res.json({ ok: true, edit: isEditSubmit, preview: !!previewFile, supporting: supportFiles.length });
     } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
   });
 
@@ -446,15 +495,17 @@ button{padding:8px 14px;border:0;border-radius:8px;cursor:pointer;font-size:14px
 .thumb{width:72px;height:72px;object-fit:cover;border-radius:8px;border:1px solid #e2e8f0;background:#fff;flex:none}
 .cdetails{display:flex;gap:12px;margin-top:10px;align-items:flex-start}.cmeta{flex:1;min-width:0}
 .badge{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;margin:0 5px 5px 0;letter-spacing:.02em}
-.b-type{background:#eef2ff;color:#3730a3}.b-rush{background:#fee2e2;color:#b91c1c}.b-sep{background:#fef3c7;color:#92400e}
+.b-type{background:#eef2ff;color:#3730a3}.b-rush{background:#fee2e2;color:#b91c1c}.b-sep{background:#fef3c7;color:#92400e}.b-edit{background:#fde68a;color:#92400e}
 .timer{font-size:12px;margin:2px 0 4px;font-weight:600}.t-green{color:#16a34a}.t-orange{color:#d97706}.t-red{color:#dc2626;font-weight:700}
 .notes{font-size:13px;color:#334155;background:#f8fafc;border-left:3px solid #cbd5e1;padding:6px 10px;border-radius:4px;margin-top:8px;white-space:pre-wrap}
 .tmpl{margin-top:8px}.tmpl .link{background:#dbeafe;color:#1e40af}.tmpl-label{font-size:12px;color:#64748b;font-weight:700;margin-bottom:3px}
+.editbox{margin-top:8px;padding:8px 10px;background:#fef2f2;border:1px solid #fecaca;border-radius:6px}.editbox .link{background:#fee2e2;color:#991b1b}
 </style></head><body>
 <div id=banner class=banner style=display:none></div>
 <header><h1>PrintReadyArt — My Orders</h1><button class=logout onclick=logout()>Log out</button></header>
 <main>
 <div id=limit class=muted></div>
+<div id=editsWrap style=display:none><h2 style="color:#b91c1c">⚑ Edit Requests</h2><div id=edits></div></div>
 <h2>Available to Claim</h2><div id=claimable></div>
 <h2>My Claimed Orders</h2><div id=claimed></div>
 </main><script>
@@ -467,20 +518,25 @@ async function load(){
   limit.textContent='Limit: '+data.openCount+' / '+data.limit+' claimed'+(data.underLimit?'':' — at limit, finish work to claim more');
   claimable.innerHTML=data.claimable.length?data.claimable.map(card).join(''):'<div class=muted>Nothing to claim right now.</div>';
   claimed.innerHTML=data.claimed.length?data.claimed.map(c=>card(c,true)).join(''):'<div class=muted>No claimed orders.</div>';
+  if(data.edits&&data.edits.length){editsWrap.style.display='block';edits.innerHTML=data.edits.map(c=>card(c,true,true)).join('');}
+  else{editsWrap.style.display='none';edits.innerHTML='';}
 }
-function card(o,claimed){
+function card(o,claimed,isEdit){
   const files=o.files.map(f=>'<a class=link target=_blank href="'+f.url+'">⬇ '+f.label+'</a>').join('');
   const sep=(!claimed&&o.separations==='yes')?'<span class=sep>SEPARATIONS</span> ':'';
   let action='';
   if(!claimed){action=data.underLimit?'<button class=claim onclick="claim(\\''+o.id+'\\')">Claim</button>':'<span class=tag>at limit</span>';}
-  else{action='<button class=upload onclick="openUpload(\\''+o.id+'\\')">Upload completed</button>';}
+  else{action='<button class=upload onclick="openUpload(\\''+o.id+'\\')">'+(isEdit?'Upload revised':'Upload completed')+'</button>';}
   let rich='';
   if(claimed){
-    const badges='<span class="badge b-type">'+esc(o.type||'—')+'</span>'+
+    const badges=(isEdit?'<span class="badge b-edit">EDIT REQUEST</span>':'')+
+      '<span class="badge b-type">'+esc(o.type||'—')+'</span>'+
       (o.rush==='yes'?'<span class="badge b-rush">RUSH</span>':'')+
       (o.separations==='yes'?'<span class="badge b-sep">SEPARATIONS</span>':'');
     const thumb=o.thumb?'<img class=thumb src="'+o.thumb+'" alt="artwork" onerror="this.style.display=\\'none\\'">':'';
-    const timer=o.claimedAt?'<div class="timer '+timerClass(o.claimedAt)+'" data-since="'+o.claimedAt+'">\\u23F1 claimed '+fmtElapsed(o.claimedAt)+' ago</div>':'';
+    const tlabel=isEdit?'edit requested':'claimed';
+    const tsince=(isEdit&&o.edit&&o.edit.created)?o.edit.created:o.claimedAt;
+    const timer=tsince?'<div class="timer '+timerClass(tsince)+'" data-since="'+tsince+'" data-label="'+tlabel+'">\\u23F1 '+tlabel+' '+fmtElapsed(tsince)+' ago</div>':'';
     const notes=o.specialInstructions?'<div class=notes><b>Special instructions:</b> '+esc(o.specialInstructions)+'</div>':'';
     let tmpl='';
     if(o.team){
@@ -488,7 +544,19 @@ function card(o,claimed){
       const ti=o.team.instructions?'<div class=notes><b>Team instructions:</b> '+esc(o.team.instructions)+'</div>':'';
       if(tl||ti)tmpl='<div class=tmpl><div class=tmpl-label>Team templates &amp; instructions</div>'+tl+ti+'</div>';
     }
-    rich='<div class=cdetails>'+thumb+'<div class=cmeta>'+badges+timer+notes+tmpl+'</div></div>';
+    // Edit-request detail block: notes, reason, and the client's reference files.
+    let editBlock='';
+    if(isEdit&&o.edit){
+      const refLinks=(o.edit.refs||[]).map(rf=>'<a class=link target=_blank href="'+rf.url+'">\\u2B07 '+esc(rf.label)+'</a>').join('');
+      editBlock='<div class=editbox>'+
+        '<div class=tmpl-label style=color:#b91c1c>What the client wants changed</div>'+
+        (o.edit.reason?'<div class=tag style=margin-bottom:4px>Reason: '+esc(o.edit.reason)+'</div>':'')+
+        (o.edit.changes?'<div class=notes style=border-left-color:#dc2626>'+esc(o.edit.changes)+'</div>':'<div class=tag>(no note provided)</div>')+
+        (refLinks?'<div style=margin-top:6px><div class=tmpl-label>Reference files</div>'+refLinks+'</div>':'')+
+        '</div>';
+    }
+    const orig=isEdit?'<div class=tmpl-label style=margin-top:8px>Original work</div>':'';
+    rich='<div class=cdetails>'+thumb+'<div class=cmeta>'+badges+timer+notes+tmpl+editBlock+'</div></div>'+orig;
   }
   let uploadBox='';
   if(claimed){
@@ -568,9 +636,9 @@ async function stopRunAs(){await fetch('/vendor/api/admin/stop-run-as',{method:'
 function anyUploadOpen(){return [...document.querySelectorAll('.uploadbox')].some(el=>el.style.display==='block');}
 setInterval(function(){
   document.querySelectorAll('.timer[data-since]').forEach(function(el){
-    var s=el.getAttribute('data-since');
+    var s=el.getAttribute('data-since'),lbl=el.getAttribute('data-label')||'claimed';
     el.className='timer '+timerClass(s);
-    el.textContent='\\u23F1 claimed '+fmtElapsed(s)+' ago';
+    el.textContent='\\u23F1 '+lbl+' '+fmtElapsed(s)+' ago';
   });
 },1000);
 load();
