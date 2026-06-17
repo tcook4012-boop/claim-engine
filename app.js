@@ -49,7 +49,7 @@ const ART = {
   isActive:       "is_active_vendor",
   capabilities:   "capabilities",
 };
-const CS = { unclaimed: "unclaimed", claimed: "claimed", review: "needs_review" };
+const CS = { unclaimed: "unclaimed", claimed: "claimed", review: "needs_review", completed: "completed", edit: "edit_requested" };
 
 // use_new_system is a real yes/no field -> Bubble returns boolean true/false.
 const YES = true;
