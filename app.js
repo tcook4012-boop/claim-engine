@@ -99,10 +99,23 @@ async function eligibleVendors(order) {
   const all = await activeVendors();
   return need.length ? all.filter(v => need.every(c => v.capabilities.includes(c))) : all;
 }
-const countClaimed = (email) =>
-  search("uploaded_image", [{ key: F.assignedArtist, constraint_type: "equals", value: email },
-                            { key: F.claimState, constraint_type: "equals", value: CS.claimed }])
-    .then(r => r.length);
+// A vendor's "load" against their cap = active claimed work PLUS open edit requests
+// (edit requests are unpaid rework; counting them throttles new paid intake until edits
+// are cleared). This single count feeds both tryClaim and rotation, so the rule is
+// enforced consistently. Edit-request reads are fail-safe: if that table can't be read,
+// we fall back to claimed-only rather than block all claiming.
+async function countClaimed(email) {
+  const claimed = await search("uploaded_image", [
+    { key: F.assignedArtist, constraint_type: "equals", value: email },
+    { key: F.claimState, constraint_type: "equals", value: CS.claimed }]);
+  let openEdits = [];
+  try {
+    openEdits = await search("edit_request", [
+      { key: "Assigned_Artist", constraint_type: "equals", value: email },
+      { key: "Completed", constraint_type: "is_empty" }]);
+  } catch (e) { console.warn("[countClaimed] edit_request count failed:", e.message); }
+  return claimed.length + openEdits.length;
+}
 
 // ------------------------------ PER-ORDER LOCK -------------------------------
 const chains = new Map();
