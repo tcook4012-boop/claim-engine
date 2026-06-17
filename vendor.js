@@ -423,9 +423,43 @@ function mountVendorPortal(app, deps) {
     res.json({ ok: true });
   });
 
+  // ---- VENDOR CONTROLS: capabilities, concurrency limit, active on/off ------
+  // Lists every artist (the artist type = vendors; clients live in the user type).
+  app.get("/vendor/api/admin/vendor-controls", requireAdminLogin, async (_req, res) => {
+    try {
+      const artists = await search("artist", []);
+      const rows = artists.map((a) => ({
+        id: a._id,
+        email: (a.email || "").toLowerCase(),
+        contact: a.contact || "",
+        capabilities: Array.isArray(a.capabilities) ? a.capabilities.map((c) => String(c).toLowerCase()) : [],
+        maxConcurrent: (a.max_concurrent_orders === 0 || a.max_concurrent_orders) ? a.max_concurrent_orders : "",
+        active: a.is_active_vendor === true,
+      })).sort((x, y) => (x.email > y.email ? 1 : -1));
+      res.json(rows);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Save one vendor's controls. Writes confirmed lowercase keys; only sets provided fields.
+  app.post("/vendor/api/admin/vendor-controls", express.json(), requireAdminLogin, async (req, res) => {
+    try {
+      const id = String(req.body.id || "");
+      if (!id) return res.status(400).json({ ok: false, error: "Missing vendor id" });
+      const patch = {};
+      if (Array.isArray(req.body.capabilities))
+        patch.capabilities = [...new Set(req.body.capabilities.map((s) => String(s).toLowerCase().trim()).filter(Boolean))];
+      if (req.body.maxConcurrent !== undefined && req.body.maxConcurrent !== "" && req.body.maxConcurrent !== null)
+        patch.max_concurrent_orders = Number(req.body.maxConcurrent);
+      if (typeof req.body.active === "boolean")
+        patch.is_active_vendor = req.body.active;
+      await bubble("PATCH", `/artist/${id}`, patch);
+      console.log(`[admin] vendor ${id} updated: ${JSON.stringify(patch)}`);
+      res.json({ ok: true });
+    } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+  });
+
   // ---- TEMP DEBUG: raw record JSON (admin only) — REMOVE after field-name check.
-  // /vendor/api/admin/raw?type=team&id=<id>   (type defaults to uploaded_image)
-  // JSON keys are the EXACT Bubble API field names. Empty fields are omitted by Bubble.
+  // /vendor/api/admin/raw?type=artist&id=<id>  (type defaults to uploaded_image)
   app.get("/vendor/api/admin/raw", requireAdminLogin, async (req, res) => {
     try {
       const type = String(req.query.type || "uploaded_image");
@@ -436,10 +470,12 @@ function mountVendorPortal(app, deps) {
   });
 
 
+
   // ---- PAGES (served HTML) -------------------------------------------------
   app.get("/vendor/login", (_req, res) => res.type("html").send(LOGIN_HTML));
   app.get("/vendor", requireVendor, (_req, res) => res.type("html").send(PORTAL_HTML));
   app.get("/vendor/admin", requireAdminLogin, (_req, res) => res.type("html").send(ADMIN_HTML));
+  app.get("/vendor/admin/controls", requireAdminLogin, (_req, res) => res.type("html").send(CONTROLS_HTML));
 }
 
 /* ----------------------------- HTML PAGES ---------------------------------- */
@@ -485,6 +521,85 @@ async function doChange(){
   location.href='/vendor';
 }
 addEventListener('keydown',e=>{if(e.key==='Enter')doLogin();});
+</script></body></html>`;
+
+const CONTROLS_HTML = `<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Admin Controls</title><style>
+body{font-family:system-ui,sans-serif;background:#f4f6fa;margin:0;color:#0f172a}
+header{background:#0f172a;color:#fff;padding:14px 20px;display:flex;justify-content:space-between;align-items:center}
+header a{color:#93c5fd;text-decoration:none;margin-left:14px;font-size:14px}
+.wrap{max-width:1050px;margin:20px auto;padding:0 16px;overflow-x:auto}
+table{border-collapse:collapse;width:100%;background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+th,td{padding:10px 12px;text-align:center;border-bottom:1px solid #eef2f6;font-size:14px}
+th{background:#f1f5f9;color:#334155;font-weight:700;font-size:13px;white-space:nowrap}
+th.vh,td.vh{text-align:left;min-width:180px}
+.vemail{font-weight:600}.vsub{color:#94a3b8;font-size:12px}
+td input[type=checkbox]{width:18px;height:18px;cursor:pointer}
+input[type=number]{width:58px;padding:5px;border:1px solid #cbd5e1;border-radius:6px}
+button{border:0;border-radius:8px;padding:7px 12px;font-weight:600;cursor:pointer}
+.addbtn{background:#e2e8f0;color:#0f172a}.logout{background:rgba(255,255,255,.2);color:#fff}
+.tagadd{padding:6px 8px;border:1px solid #cbd5e1;border-radius:6px;width:170px}
+.saved{font-size:13px;margin-left:10px}
+.switch{position:relative;display:inline-block;width:42px;height:24px}
+.switch input{display:none}.slider{position:absolute;cursor:pointer;inset:0;background:#cbd5e1;border-radius:999px;transition:.2s}
+.slider:before{content:"";position:absolute;height:18px;width:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}
+.switch input:checked+.slider{background:#16a34a}.switch input:checked+.slider:before{transform:translateX(18px)}
+</style></head><body>
+<header><div><b>Admin Controls — Vendor Capabilities</b><a href="/vendor/admin">Vendor logins &amp; run-as &rarr;</a></div>
+<button class=logout onclick="logout()">Log out</button></header>
+<div class=wrap><div id=grid class=vsub>Loading&hellip;</div></div>
+<script>
+const COLS_KNOWN=[['vector','Vector'],['separations','Separations'],['digitizing','Digitizing'],['ofm','ofm'],['pfx','pfx'],['digital_printing','Digital (DTF/DTG)']];
+let vendors=[],columns=[];
+async function load(){
+  try{const r=await fetch('/vendor/api/admin/vendor-controls');vendors=await r.json();buildColumns();render();}
+  catch(e){document.getElementById('grid').textContent='Failed to load vendors.';}
+}
+function buildColumns(){
+  const tags=[];COLS_KNOWN.forEach(function(c){tags.push(c[0]);});
+  vendors.forEach(function(v){(v.capabilities||[]).forEach(function(t){t=String(t).toLowerCase();if(tags.indexOf(t)<0)tags.push(t);});});
+  columns=tags.map(function(t){const k=COLS_KNOWN.find(function(c){return c[0]===t;});return {tag:t,label:k?k[1]:t};});
+}
+function render(){
+  const grid=document.getElementById('grid');
+  if(!Array.isArray(vendors)||!vendors.length){grid.textContent='No vendors found.';return;}
+  let head='<tr><th class=vh>Vendor</th>';
+  columns.forEach(function(c){head+='<th>'+c.label+'</th>';});
+  head+='<th>Active</th><th>Max</th></tr>';
+  let rows='';
+  vendors.forEach(function(v,i){
+    const caps=new Set((v.capabilities||[]).map(function(c){return String(c).toLowerCase();}));
+    rows+='<tr data-i="'+i+'"><td class=vh><div class=vemail>'+(v.email||'(no email)')+'</div><div class=vsub>'+(v.contact||'')+'</div></td>';
+    columns.forEach(function(c){rows+='<td><input type=checkbox data-cap="'+c.tag+'" '+(caps.has(c.tag)?'checked':'')+'></td>';});
+    rows+='<td><label class=switch><input type=checkbox class=active '+(v.active?'checked':'')+'><span class=slider></span></label></td>';
+    rows+='<td><input type=number class=max min=0 value="'+((v.maxConcurrent===0||v.maxConcurrent)?v.maxConcurrent:'')+'"></td></tr>';
+  });
+  grid.innerHTML='<table>'+head+rows+'</table><div style=margin-top:14px><input id=newcap class=tagadd placeholder="add capability column"> <button class=addbtn onclick="addCol()">Add column</button> <span id=status class=saved></span></div>';
+  grid.querySelector('table').addEventListener('change',function(e){const tr=e.target.closest('tr[data-i]');if(tr)saveRow(tr);});
+}
+function addCol(){
+  const inp=document.getElementById('newcap');const raw=inp.value.trim();const t=raw.toLowerCase().replace(/\s+/g,'_');
+  if(!t){return;}
+  if(columns.find(function(c){return c.tag===t;})){inp.value='';return;}
+  columns.push({tag:t,label:raw});inp.value='';render();
+}
+async function saveRow(tr){
+  const i=tr.getAttribute('data-i');const v=vendors[i];
+  const capabilities=[].slice.call(tr.querySelectorAll('input[type=checkbox][data-cap]')).filter(function(c){return c.checked;}).map(function(c){return c.getAttribute('data-cap');});
+  const active=tr.querySelector('.active').checked;
+  const maxv=tr.querySelector('.max').value;
+  const status=document.getElementById('status');status.textContent='Saving\u2026';status.style.color='#64748b';
+  try{
+    const r=await fetch('/vendor/api/admin/vendor-controls',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:v.id,capabilities:capabilities,maxConcurrent:maxv,active:active})});
+    const j=await r.json();
+    v.capabilities=capabilities;v.active=active;v.maxConcurrent=maxv;
+    status.textContent=j.ok?('Saved '+(v.email||'')+' \u2713'):('Error: '+(j.error||'failed'));
+    status.style.color=j.ok?'#16a34a':'#dc2626';
+  }catch(e){status.textContent='Error saving';status.style.color='#dc2626';}
+  setTimeout(function(){status.textContent='';},2500);
+}
+async function logout(){await fetch('/vendor/api/logout',{method:'POST'});location.href='/vendor/login';}
+load();
 </script></body></html>`;
 
 const PORTAL_HTML = `<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1">
@@ -664,7 +779,7 @@ button{padding:7px 12px;border:0;border-radius:8px;cursor:pointer;font-size:13px
 .runas{background:#7c3aed}.create{background:#16a34a}.logout{background:rgba(255,255,255,.2)}
 input{padding:8px;border:1px solid #cbd5e1;border-radius:6px}.tag{font-size:12px;color:#64748b}
 </style></head><body>
-<header><h1 style=font-size:17px;margin:0>Vendor Admin</h1><button class=logout onclick=logout()>Log out</button></header>
+<header><h1 style=font-size:17px;margin:0>Vendor Admin</h1><div><a href="/vendor/admin/controls" style="color:#93c5fd;text-decoration:none;margin-right:16px;font-size:14px">⚙ Vendor controls</a><button class=logout onclick=logout()>Log out</button></div></header>
 <main><div id=list></div></main><script>
 async function load(){
   const r=await fetch('/vendor/api/admin/vendors');const v=await r.json();
