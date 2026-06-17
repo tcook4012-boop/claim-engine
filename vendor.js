@@ -484,6 +484,72 @@ function mountVendorPortal(app, deps) {
     } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
   });
 
+  // ---- ADMIN ORDERS DASHBOARD: all pending orders + push/reassign/cancel -----
+  app.get("/vendor/api/admin/dashboard", requireAdminLogin, async (_req, res) => {
+    try {
+      const [artists, pending, openEdits] = await Promise.all([
+        search("artist", []),
+        search("uploaded_image", [{ key: "Pending", constraint_type: "equals", value: true }]),
+        search("edit_request", [{ key: "Completed", constraint_type: "is_empty" }]),
+      ]);
+      const now = Date.now();
+      const editsByVendor = {};
+      openEdits.forEach((e) => { const a = String(e.Assigned_Artist || "").toLowerCase(); if (a) editsByVendor[a] = (editsByVendor[a] || 0) + 1; });
+      const orders = pending.map((o) => ({
+        id: o._id, orderNo: o["Order#"] || "", type: o.Order_Type || "",
+        user: o.User || "", assigned: String(o[F.assignedArtist] || ""),
+        state: o[F.claimState] || "",
+        ageHours: o["Created Date"] ? +(((now - new Date(o["Created Date"]).getTime()) / 3600000).toFixed(2)) : null,
+        separations: o[F.separations] || "no", rush: o.Rush || "no",
+      })).sort((a, b) => (b.ageHours || 0) - (a.ageHours || 0));
+      const artistRows = artists.map((a) => ({
+        email: String(a.email || "").toLowerCase(), contact: a.contact || "", active: a.is_active_vendor === true,
+        cap: a.max_concurrent_orders, openEditsNow: editsByVendor[String(a.email || "").toLowerCase()] || 0,
+        pending: a.pending_counter, aging: a.aging_counter,
+        ordersToday: a.daily_counter, ordersMonth: a.monthly_counter,
+        editsToday: a.edits_completed_today, editsMonth: a.monthly_edits,
+        orderSpeedToday: a.daily_timer, orderSpeedMonth: a.monthly_timer, editSpeedMonth: a.monthly_edit_timer,
+        editPctToday: a["Edit Percentage Today"], editPctMonth: a["Edit Percentage Month"],
+      })).sort((x, y) => (x.email > y.email ? 1 : -1));
+      const totals = {
+        pending: pending.length,
+        unassigned: pending.filter((o) => !o[F.assignedArtist]).length,
+        openEdits: openEdits.length,
+        vector: pending.filter((o) => o.Order_Type === "Vector").length,
+        digitizing: pending.filter((o) => o.Order_Type === "Digitizing").length,
+        digital: pending.filter((o) => o.Order_Type === "Digital (DTF/DTG)").length,
+      };
+      const vendors = artists.filter((a) => a.is_active_vendor === true)
+        .map((a) => String(a.email || "").toLowerCase()).filter(Boolean).sort();
+      res.json({ totals, artists: artistRows, orders, vendors });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Push or reassign an order to a specific vendor (admin override, off-cap).
+  app.post("/vendor/api/admin/assign-order", express.json(), requireAdminLogin, async (req, res) => {
+    try {
+      const id = String(req.body.id || "");
+      const email = String(req.body.email || "").toLowerCase().trim();
+      if (!id || !email) return res.status(400).json({ ok: false, error: "Need order id + vendor email" });
+      await patchOrder(id, { [F.assignedArtist]: email, [F.claimState]: CS.claimed, claimed_at: Date.now() });
+      console.log(`[admin] order ${id} assigned to ${email}`);
+      try { await logEvent(id, email, "admin_assigned", "admin push/reassign"); } catch {}
+      res.json({ ok: true });
+    } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+  });
+
+  // Cancel an order: stop rotation + drop from queues. Non-destructive (reversible).
+  app.post("/vendor/api/admin/cancel-order", express.json(), requireAdminLogin, async (req, res) => {
+    try {
+      const id = String(req.body.id || "");
+      if (!id) return res.status(400).json({ ok: false, error: "Need order id" });
+      await patchOrder(id, { [F.claimState]: "cancelled", Pending: false });
+      console.log(`[admin] order ${id} cancelled`);
+      try { await logEvent(id, "", "admin_cancelled", "admin cancelled order"); } catch {}
+      res.json({ ok: true });
+    } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+  });
+
   // ---- TEMP DEBUG: raw record JSON (admin only) — REMOVE after field-name check.
   // /vendor/api/admin/raw?type=artist&id=<id>  (type defaults to uploaded_image)
   app.get("/vendor/api/admin/raw", requireAdminLogin, async (req, res) => {
@@ -502,6 +568,7 @@ function mountVendorPortal(app, deps) {
   app.get("/vendor", requireVendor, (_req, res) => res.type("html").send(PORTAL_HTML));
   app.get("/vendor/admin", requireAdminLogin, (_req, res) => res.type("html").send(ADMIN_HTML));
   app.get("/vendor/admin/controls", requireAdminLogin, (_req, res) => res.type("html").send(CONTROLS_HTML));
+  app.get("/vendor/admin/orders", requireAdminLogin, (_req, res) => res.type("html").send(ADMIN_ORDERS_HTML));
 }
 
 /* ----------------------------- HTML PAGES ---------------------------------- */
@@ -571,7 +638,7 @@ button{border:0;border-radius:8px;padding:7px 12px;font-weight:600;cursor:pointe
 .slider:before{content:"";position:absolute;height:18px;width:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}
 .switch input:checked+.slider{background:#16a34a}.switch input:checked+.slider:before{transform:translateX(18px)}
 </style></head><body>
-<header><div><b>Admin Controls — Vendor Capabilities</b><a href="/vendor/admin">Vendor logins &amp; run-as &rarr;</a></div>
+<header><div><b>Admin Controls — Vendor Capabilities</b><a href="/vendor/admin">Vendor logins</a><a href="/vendor/admin/orders">Orders dashboard</a></div>
 <button class=logout onclick="logout()">Log out</button></header>
 <div class=wrap><div id=grid class=vsub>Loading&hellip;</div></div>
 <script>
@@ -623,6 +690,119 @@ async function saveRow(tr){
     status.style.color=j.ok?'#16a34a':'#dc2626';
   }catch(e){status.textContent='Error saving';status.style.color='#dc2626';}
   setTimeout(function(){status.textContent='';},2500);
+}
+async function logout(){await fetch('/vendor/api/logout',{method:'POST'});location.href='/vendor/login';}
+load();
+</script></body></html>`;
+
+const ADMIN_ORDERS_HTML = `<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Orders Dashboard</title><style>
+body{font-family:system-ui,sans-serif;background:#f4f6fa;margin:0;color:#0f172a}
+header{background:#0f172a;color:#fff;padding:14px 20px;display:flex;justify-content:space-between;align-items:center}
+header a{color:#93c5fd;text-decoration:none;margin-left:14px;font-size:14px}
+.wrap{max-width:1200px;margin:18px auto;padding:0 16px}
+.totals{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:16px}
+.tcard{background:#fff;border-radius:10px;padding:12px 16px;box-shadow:0 1px 3px rgba(0,0,0,.08);min-width:120px}
+.tcard .n{font-size:22px;font-weight:800}.tcard .l{font-size:12px;color:#64748b}
+.t-warn .n{color:#dc2626}
+.sec{font-size:14px;color:#475569;font-weight:700;margin:18px 0 10px}
+.statwrap{overflow-x:auto}
+table.stats{border-collapse:collapse;width:100%;background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.08);font-size:13px}
+table.stats th,table.stats td{padding:8px 10px;border-bottom:1px solid #eef2f6;text-align:center;white-space:nowrap}
+table.stats th{background:#f1f5f9;color:#334155;font-weight:700}
+table.stats td.vn,table.stats th.vn{text-align:left}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}.on{background:#16a34a}.off{background:#cbd5e1}
+.ocard{background:#fff;border-radius:10px;padding:14px;margin-bottom:10px;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+.ohead{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.ono{font-weight:700}.osub{color:#64748b;font-size:13px}
+.age{font-weight:700;font-size:13px}.a-green{color:#16a34a}.a-orange{color:#d97706}.a-red{color:#dc2626}
+.oact{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px}
+select,input{padding:6px 8px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px}
+button{border:0;border-radius:8px;padding:7px 12px;font-weight:600;cursor:pointer;font-size:13px}
+.assign{background:#2563eb;color:#fff}.cancel{background:#fee2e2;color:#b91c1c}.logout{background:rgba(255,255,255,.2);color:#fff}
+.badge{display:inline-block;font-size:11px;font-weight:700;padding:2px 7px;border-radius:999px;margin-left:6px}
+.b-un{background:#fef3c7;color:#92400e}.b-rush{background:#fee2e2;color:#b91c1c}.b-sep{background:#e0e7ff;color:#3730a3}
+.msg{font-size:12px;margin-left:6px}
+</style></head><body>
+<header><div><b>Orders Dashboard</b><a href="/vendor/admin">Vendor logins</a><a href="/vendor/admin/controls">Vendor controls</a></div>
+<button class=logout onclick="logout()">Log out</button></header>
+<div class=wrap>
+<div id=totals class=totals></div>
+<div class=sec>By vendor (stored metrics)</div><div class=statwrap><div id=stats></div></div>
+<div class=sec>All pending orders <span id=ocount class=osub></span></div><div id=orders></div>
+</div>
+<script>
+let DATA={vendors:[]};
+function ageClass(h){if(h==null)return '';if(h>8)return 'a-red';if(h>=6)return 'a-orange';return 'a-green';}
+async function load(){
+  try{const r=await fetch('/vendor/api/admin/dashboard');DATA=await r.json();render();}
+  catch(e){document.getElementById('orders').textContent='Failed to load dashboard.';}
+}
+function render(){
+  const t=DATA.totals||{};
+  document.getElementById('totals').innerHTML=
+    tcard(t.pending,'Pending orders')+tcard(t.unassigned,'Unassigned',true)+tcard(t.openEdits,'Open edits')+
+    tcard(t.vector,'Vector')+tcard(t.digitizing,'Digitizing')+tcard(t.digital,'Digital (DTF/DTG)');
+  renderStats();renderOrders();
+}
+function tcard(n,l,warn){return '<div class="tcard'+(warn&&n?' t-warn':'')+'"><div class=n>'+(n==null?'0':n)+'</div><div class=l>'+l+'</div></div>';}
+function renderStats(){
+  const a=DATA.artists||[];
+  if(!a.length){document.getElementById('stats').textContent='No vendors.';return;}
+  const cols=[['pending','Orders Pending'],['openEditsNow','Open Edits (live)'],['aging','Aging'],
+    ['orderSpeedToday','Order Spd Today'],['orderSpeedMonth','Order Spd Mo'],['editSpeedMonth','Edit Spd Mo'],
+    ['editPctToday','Edit % Today'],['editPctMonth','Edit % Mo'],
+    ['editsToday','Edits Fin Today'],['editsMonth','Edits Fin Mo'],['ordersToday','Ord Fin Today'],['ordersMonth','Ord Fin Mo'],['cap','Cap']];
+  let h='<table class=stats><tr><th class=vn>Vendor</th>';cols.forEach(function(c){h+='<th>'+c[1]+'</th>';});h+='</tr>';
+  a.forEach(function(v){
+    h+='<tr><td class=vn><span class="dot '+(v.active?'on':'off')+'"></span>'+(v.contact||v.email||'(no email)')+'<div class=osub>'+(v.email||'')+'</div></td>';
+    cols.forEach(function(c){var val=v[c[0]];h+='<td>'+(val==null||val===''?'–':val)+'</td>';});
+    h+='</tr>';
+  });
+  h+='</table>';document.getElementById('stats').innerHTML=h;
+}
+function renderOrders(){
+  const o=DATA.orders||[];
+  document.getElementById('ocount').textContent='('+o.length+')';
+  if(!o.length){document.getElementById('orders').innerHTML='<div class=osub>No pending orders.</div>';return;}
+  const opts=(DATA.vendors||[]).map(function(e){return '<option value="'+e+'">'+e+'</option>';}).join('');
+  document.getElementById('orders').innerHTML=o.map(function(x){
+    const assigned=x.assigned?('Artist: '+x.assigned):'<span class="badge b-un">UNASSIGNED</span>';
+    const badges=(x.rush==='yes'?'<span class="badge b-rush">RUSH</span>':'')+(x.separations==='yes'?'<span class="badge b-sep">SEPS</span>':'');
+    const age=x.ageHours==null?'':'<span class="age '+ageClass(x.ageHours)+'">Age: '+x.ageHours+'h</span>';
+    return '<div class=ocard data-id="'+x.id+'"><div class=ohead>'+
+      '<div><div class=ono>Order # '+(x.orderNo||x.id)+' '+badges+'</div>'+
+      '<div class=osub>'+(x.type||'')+' &middot; User: '+(x.user||'?')+'</div>'+
+      '<div class=osub>'+assigned+'</div></div><div>'+age+'</div></div>'+
+      '<div class=oact><select class=vsel>'+(x.assigned?'':'<option value="">choose vendor…</option>')+opts+'</select>'+
+      '<button class=assign>'+(x.assigned?'Reassign':'Push')+'</button>'+
+      '<button class=cancel>Cancel</button><span class=msg></span></div></div>';
+  }).join('');
+  // preselect current assignee
+  o.forEach(function(x){if(x.assigned){const sel=document.querySelector('.ocard[data-id="'+x.id+'"] .vsel');if(sel)sel.value=x.assigned;}});
+  document.getElementById('orders').addEventListener('click',onAction);
+}
+async function onAction(e){
+  const card=e.target.closest('.ocard');if(!card)return;
+  const id=card.getAttribute('data-id');const msg=card.querySelector('.msg');
+  if(e.target.classList.contains('assign')){
+    const email=card.querySelector('.vsel').value;
+    if(!email){msg.textContent='Pick a vendor';msg.style.color='#dc2626';return;}
+    msg.textContent='Assigning…';msg.style.color='#64748b';
+    await post('/vendor/api/admin/assign-order',{id:id,email:email},msg,'Assigned ✓');
+  }else if(e.target.classList.contains('cancel')){
+    if(!confirm('Cancel this order? It will stop rotating and leave all queues.'))return;
+    msg.textContent='Cancelling…';msg.style.color='#64748b';
+    await post('/vendor/api/admin/cancel-order',{id:id},msg,'Cancelled ✓');
+  }
+}
+async function post(url,body,msg,okText){
+  try{
+    const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const j=await r.json();
+    if(j.ok){msg.textContent=okText;msg.style.color='#16a34a';setTimeout(load,700);}
+    else{msg.textContent='Error: '+(j.error||'failed');msg.style.color='#dc2626';}
+  }catch(e){msg.textContent='Error';msg.style.color='#dc2626';}
 }
 async function logout(){await fetch('/vendor/api/logout',{method:'POST'});location.href='/vendor/login';}
 load();
@@ -805,7 +985,7 @@ button{padding:7px 12px;border:0;border-radius:8px;cursor:pointer;font-size:13px
 .runas{background:#7c3aed}.create{background:#16a34a}.logout{background:rgba(255,255,255,.2)}
 input{padding:8px;border:1px solid #cbd5e1;border-radius:6px}.tag{font-size:12px;color:#64748b}
 </style></head><body>
-<header><h1 style=font-size:17px;margin:0>Vendor Admin</h1><div><a href="/vendor/admin/controls" style="color:#93c5fd;text-decoration:none;margin-right:16px;font-size:14px">⚙ Vendor controls</a><button class=logout onclick=logout()>Log out</button></div></header>
+<header><h1 style=font-size:17px;margin:0>Vendor Admin</h1><div><a href="/vendor/admin/controls" style="color:#93c5fd;text-decoration:none;margin-right:14px;font-size:14px">⚙ Vendor controls</a><a href="/vendor/admin/orders" style="color:#93c5fd;text-decoration:none;margin-right:16px;font-size:14px">Orders dashboard</a><button class=logout onclick=logout()>Log out</button></div></header>
 <main>
 <div style="text-align:right;margin-bottom:12px"><button class=create onclick="toggleAdd()" id=addToggle>+ Add new vendor</button></div>
 <div id=addForm style="display:none;background:#fff;border-radius:10px;padding:16px;margin-bottom:16px;box-shadow:0 1px 4px rgba(0,0,0,.06)">
