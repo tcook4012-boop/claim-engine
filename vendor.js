@@ -185,11 +185,28 @@ function mountVendorPortal(app, deps) {
       details: {
         ArtDims_Seps: o.ArtDims_Seps || "", FilmSizeSeps: o.FilmSizeSeps || "",
         ArtPlacement_Seps: o.ArtPlacement_Seps || "", Rush: o.Rush || "no",
+        Height: o.Height || "", Width: o.Width || "",
         Unit: o.Unit || "", "cm/in": o["cm/in"] || "",
       },
     };
     if (team) v.team = team;
     return v;
+  }
+
+  // New_Orders holds extra Digitizing spec, joined to the order by Order#.
+  // Confirmed keys: 3D_Puff (bool), fabric_content (lowercase), Placement.
+  async function newOrdersDetail(orderNo) {
+    if (!orderNo) return null;
+    try {
+      const rows = await search("new_orders", [{ key: "Order#", constraint_type: "equals", value: orderNo }]);
+      const n = rows[0];
+      if (!n) return null;
+      return {
+        puff: n["3D_Puff"] === true ? "Yes" : (n["3D_Puff"] === false ? "No" : ""),
+        fabric: n.fabric_content || "",
+        placement: n.Placement || "",
+      };
+    } catch (e) { console.warn("[orders] new_orders lookup failed for " + orderNo + ":", e.message); return null; }
   }
 
   app.get("/vendor/api/orders", requireVendor, async (req, res) => {
@@ -204,8 +221,14 @@ function mountVendorPortal(app, deps) {
         { key: F.assignedArtist, constraint_type: "equals", value: email },
         { key: F.claimState, constraint_type: "equals", value: CS.claimed }]);
       const teamCache = new Map();
-      const claimedViews = await Promise.all(mine.map(async (o) =>
-        orderView(o, await teamDocs(o.Team_Name, teamCache))));
+      const claimedViews = await Promise.all(mine.map(async (o) => {
+        const view = orderView(o, await teamDocs(o.Team_Name, teamCache));
+        if ((o.Order_Type || "") === "Digitizing") {
+          const nd = await newOrdersDetail(o["Order#"]);
+          if (nd) view.details.newOrder = nd;
+        }
+        return view;
+      }));
       // Edit requests: OPEN Edit_Request records (blank Completed) assigned to this vendor.
       // The table is the source of truth; we join to the order by Order# for original work.
       const linkify = (v) => (!v ? null : (String(v).startsWith("//") ? "https:" + v : String(v)));
@@ -903,6 +926,9 @@ button{padding:8px 14px;border:0;border-radius:8px;cursor:pointer;font-size:14px
 .muted{color:#94a3b8;font-size:14px}.sep{color:#b45309;font-weight:600;font-size:12px}
 .thumb{width:72px;height:72px;object-fit:cover;border-radius:8px;border:1px solid #e2e8f0;background:#fff;flex:none}
 .cdetails{display:flex;gap:12px;margin-top:10px;align-items:flex-start}.cmeta{flex:1;min-width:0}
+.spec{background:#f0f9ff;border:1px solid #e0f2fe;border-radius:8px;padding:8px 12px;margin-top:8px}
+.spec-label{font-size:12px;color:#0369a1;font-weight:700;margin-bottom:4px}
+.specline{font-size:13px;color:#334155;margin:2px 0}
 .badge{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;margin:0 5px 5px 0;letter-spacing:.02em}
 .b-type{background:#eef2ff;color:#3730a3}.b-rush{background:#fee2e2;color:#b91c1c}.b-sep{background:#fef3c7;color:#92400e}.b-edit{background:#fde68a;color:#92400e}
 .timer{font-size:12px;margin:2px 0 4px;font-weight:600}.t-green{color:#16a34a}.t-orange{color:#d97706}.t-red{color:#dc2626;font-weight:700}
@@ -948,6 +974,20 @@ function card(o,claimed,isEdit){
     const tsince=(isEdit&&o.edit&&o.edit.created)?o.edit.created:o.claimedAt;
     const timer=tsince?'<div class="timer '+timerClass(tsince)+'" data-since="'+tsince+'" data-label="'+tlabel+'">\\u23F1 '+tlabel+' '+fmtElapsed(tsince)+' ago</div>':'';
     const notes=o.specialInstructions?'<div class=notes><b>Special instructions:</b> '+esc(o.specialInstructions)+'</div>':'';
+    // Job-spec blocks: separations detail (any type with Separations=yes) and/or digitizing detail.
+    let jobspec='';
+    const d=o.details||{};
+    const unit=d['cm/in']||d.Unit||'';
+    function specRow(label,val){return (val===''||val==null)?'':'<div class=specline><b>'+label+':</b> '+esc(String(val))+'</div>';}
+    if(o.separations==='yes'){
+      const body=specRow('Film Size',d.FilmSizeSeps)+specRow('Art Size',d.ArtDims_Seps)+specRow('Art Placement',d.ArtPlacement_Seps)+specRow('Unit',unit);
+      if(body)jobspec+='<div class=spec><div class=spec-label>Separations spec</div>'+body+'</div>';
+    }
+    if((o.type||'').toLowerCase()==='digitizing'){
+      const no=d.newOrder||{};
+      const body=specRow('Height',d.Height)+specRow('Width',d.Width)+specRow('Unit',unit)+specRow('3D Puff',no.puff)+specRow('Fabric content',no.fabric)+specRow('Placement',no.placement);
+      if(body)jobspec+='<div class=spec><div class=spec-label>Digitizing spec</div>'+body+'</div>';
+    }
     let tmpl='';
     if(o.team){
       const tl=(o.team.templates||[]).map(t=>'<a class=link target=_blank href="'+t.url+'">\\u2B07 '+esc(t.label)+'</a>').join('');
@@ -966,7 +1006,7 @@ function card(o,claimed,isEdit){
         '</div>';
     }
     const orig=isEdit?'<div class=tmpl-label style=margin-top:8px>Original work</div>':'';
-    rich='<div class=cdetails>'+thumb+'<div class=cmeta>'+badges+timer+notes+tmpl+editBlock+'</div></div>'+orig;
+    rich='<div class=cdetails>'+thumb+'<div class=cmeta>'+badges+timer+notes+jobspec+tmpl+editBlock+'</div></div>'+orig;
   }
   let uploadBox='';
   if(claimed){
