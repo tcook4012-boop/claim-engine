@@ -147,20 +147,23 @@ function mountVendorPortal(app, deps) {
     if (Array.isArray(o.Supporting_Files)) o.Supporting_Files.forEach((f, i) => push(`Supporting ${i + 1}`, f));
     return out;
   }
-  // Fetch a Team's vendor-facing docs (templates + special instructions). FAIL-SAFE:
-  // any error (Team not API-exposed, missing field, bad id) returns empty, never throws,
-  // so the order card always renders even if the team lookup can't complete.
+  // Fetch a Team's vendor-facing docs, split by category. FAIL-SAFE: any error returns
+  // empty, never throws. Template_1 & Template_3 + Instructions_1 are SEPARATIONS docs;
+  // Template_2 + Instructions_2 are DIGITIZING docs.
   async function teamDocs(teamId, cache) {
-    if (!teamId) return { templates: [], instructions: "" };
+    const empty = { sepTemplates: [], digTemplates: [], sepInstr: "", digInstr: "" };
+    if (!teamId) return empty;
     if (cache && cache.has(teamId)) return cache.get(teamId);
     const linkify = (val) => (!val ? null : (String(val).startsWith("//") ? "https:" + val : String(val)));
-    let docs = { templates: [], instructions: "" };
+    let docs = { sepTemplates: [], digTemplates: [], sepInstr: "", digInstr: "" };
     try {
       const t = await bubble("GET", `/team/${teamId}`).then(r => r.response);
-      [["Template 1", t.Client_Template_1], ["Template 2", t.Client_Template_2], ["Template 3", t.Client_Template_3]]
-        .forEach(([label, val]) => { const u = linkify(val); if (u) docs.templates.push({ label, url: u }); });
-      docs.instructions = [t.Client_Special_Instructions_1, t.Client_Special_Instructions_2]
-        .filter((s) => s && String(s).trim()).join("\n\n");
+      const t1 = linkify(t.Client_Template_1), t2 = linkify(t.Client_Template_2), t3 = linkify(t.Client_Template_3);
+      if (t1) docs.sepTemplates.push({ label: "Separations Template", url: t1 });
+      if (t3) docs.sepTemplates.push({ label: "Separations Template 2", url: t3 });
+      if (t2) docs.digTemplates.push({ label: "Digitizing Template", url: t2 });
+      docs.sepInstr = String(t.Client_Special_Instructions_1 || "").trim();
+      docs.digInstr = String(t.Client_Special_Instructions_2 || "").trim();
     } catch (e) { console.warn("[teamDocs] lookup failed for team " + teamId + ":", e.message); }
     if (cache) cache.set(teamId, docs);
     return docs;
@@ -990,8 +993,12 @@ function card(o,claimed,isEdit){
     }
     let tmpl='';
     if(o.team){
-      const tl=(o.team.templates||[]).map(t=>'<a class=link target=_blank href="'+t.url+'">\\u2B07 '+esc(t.label)+'</a>').join('');
-      const ti=o.team.instructions?'<div class=notes><b>Team instructions:</b> '+esc(o.team.instructions)+'</div>':'';
+      let tpl=[],instrParts=[];
+      if(o.separations==='yes'){tpl=tpl.concat(o.team.sepTemplates||[]);if(o.team.sepInstr)instrParts.push(o.team.sepInstr);}
+      if((o.type||'').toLowerCase()==='digitizing'){tpl=tpl.concat(o.team.digTemplates||[]);if(o.team.digInstr)instrParts.push(o.team.digInstr);}
+      const tl=tpl.map(t=>'<a class=link target=_blank href="'+t.url+'">\\u2B07 '+esc(t.label)+'</a>').join('');
+      const instr=instrParts.join('\\n\\n');
+      const ti=instr?'<div class=notes><b>Team instructions:</b> '+esc(instr)+'</div>':'';
       if(tl||ti)tmpl='<div class=tmpl><div class=tmpl-label>Team templates &amp; instructions</div>'+tl+ti+'</div>';
     }
     // Edit-request detail block: notes, reason, and the client's reference files.
