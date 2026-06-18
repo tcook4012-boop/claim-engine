@@ -950,25 +950,35 @@ const PORTAL_HTML = `<!doctype html><html><head><meta charset=utf8><meta name=vi
 body{font-family:system-ui,sans-serif;background:#f4f6fa;margin:0;color:#0f172a}
 header{background:#2563eb;color:#fff;padding:14px 20px;display:flex;justify-content:space-between;align-items:center}
 header h1{font-size:17px;margin:0}.banner{background:#f59e0b;color:#000;text-align:center;padding:8px;font-size:14px;font-weight:600}
-main{max-width:900px;margin:20px auto;padding:0 16px}h2{font-size:15px;color:#475569;margin:24px 0 10px}
-.card{background:#fff;border-radius:10px;padding:16px;margin-bottom:12px;box-shadow:0 1px 4px rgba(0,0,0,.06)}
+main{max-width:900px;margin:20px auto;padding:0 16px}h2{font-size:13px;color:#64748b;margin:26px 0 12px;text-transform:uppercase;letter-spacing:.05em;font-weight:700}
+.card{background:#fff;border-radius:12px;margin-bottom:14px;box-shadow:0 1px 3px rgba(15,23,42,.08),0 1px 2px rgba(15,23,42,.04);border-left:4px solid #cbd5e1;overflow:hidden}
+.card.u-green{border-left-color:#22c55e}.card.u-orange{border-left-color:#f59e0b}.card.u-red{border-left-color:#ef4444}.card.u-none{border-left-color:#cbd5e1}
+.chead{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:14px 16px 10px}
+.ctitle{font-weight:700;font-size:16px;line-height:1.2}
+.eyebrow{font-size:11px;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;margin-top:4px;font-weight:600}
+.cbody{display:flex;gap:14px;align-items:flex-start;padding:0 16px 12px}
+.cthumb{flex:none}.cthumb img{width:88px;height:88px;object-fit:cover;border-radius:8px;border:1px solid #e2e8f0;background:#fff;cursor:pointer;transition:transform .12s}.cthumb img:hover{transform:scale(1.03)}
+.cmeta{flex:1;min-width:0}
+.cfoot{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;padding:11px 16px;border-top:1px solid #f1f5f9;background:#fafbfc}
+.cfiles{display:flex;flex-wrap:wrap;gap:4px;align-items:center}
 .row{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
 .ref{font-weight:700;font-size:15px}.tag{font-size:12px;color:#64748b}
-button{padding:8px 14px;border:0;border-radius:8px;cursor:pointer;font-size:14px}
-.claim{background:#16a34a;color:#fff}.upload{background:#2563eb;color:#fff}.link{background:#e2e8f0;color:#0f172a;text-decoration:none;display:inline-block;margin:3px 4px 0 0;padding:6px 10px;border-radius:6px;font-size:13px}
-.logout{background:rgba(255,255,255,.2);color:#fff}.details{font-size:13px;color:#475569;margin-top:8px;display:none}
+button{padding:8px 15px;border:0;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600}
+.claim{background:#16a34a;color:#fff}.upload{background:#2563eb;color:#fff}
+.link{background:#eef2f6;color:#334155;text-decoration:none;display:inline-flex;align-items:center;gap:4px;margin:2px 2px 0 0;padding:6px 11px;border-radius:7px;font-size:13px;font-weight:500}.link:hover{background:#e2e8f0}
+.logout{background:rgba(255,255,255,.2);color:#fff;font-weight:600}
 .muted{color:#94a3b8;font-size:14px}.sep{color:#b45309;font-weight:600;font-size:12px}
-.thumb{width:72px;height:72px;object-fit:cover;border-radius:8px;border:1px solid #e2e8f0;background:#fff;flex:none}
-.cdetails{display:flex;gap:12px;margin-top:10px;align-items:flex-start}.cmeta{flex:1;min-width:0}
-.spec{background:#f0f9ff;border:1px solid #e0f2fe;border-radius:8px;padding:8px 12px;margin-top:8px}
-.spec-label{font-size:12px;color:#0369a1;font-weight:700;margin-bottom:4px}
-.specline{font-size:13px;color:#334155;margin:2px 0}
+.thumb{width:88px;height:88px;object-fit:cover;border-radius:8px;border:1px solid #e2e8f0;background:#fff;flex:none}
+.spec{background:#f0f9ff;border:1px solid #e0f2fe;border-radius:8px;padding:10px 12px;margin-top:8px}
+.spec-label{font-size:11px;color:#0369a1;font-weight:700;margin-bottom:6px;text-transform:uppercase;letter-spacing:.04em}
+.specline{font-size:13px;color:#334155;margin:3px 0}.specline b{color:#0f172a}
 .badge{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;margin:0 5px 5px 0;letter-spacing:.02em}
 .b-type{background:#eef2ff;color:#3730a3}.b-rush{background:#fee2e2;color:#b91c1c}.b-sep{background:#fef3c7;color:#92400e}.b-edit{background:#fde68a;color:#92400e}
-.timer{font-size:12px;margin:2px 0 4px;font-weight:600}.t-green{color:#16a34a}.t-orange{color:#d97706}.t-red{color:#dc2626;font-weight:700}
-.notes{font-size:13px;color:#334155;background:#f8fafc;border-left:3px solid #cbd5e1;padding:6px 10px;border-radius:4px;margin-top:8px;white-space:pre-wrap}
-.tmpl{margin-top:8px}.tmpl .link{background:#dbeafe;color:#1e40af}.tmpl-label{font-size:12px;color:#64748b;font-weight:700;margin-bottom:3px}
-.editbox{margin-top:8px;padding:8px 10px;background:#fef2f2;border:1px solid #fecaca;border-radius:6px}.editbox .link{background:#fee2e2;color:#991b1b}
+.timer{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:700;padding:4px 11px;border-radius:999px;white-space:nowrap}
+.t-green{background:#dcfce7;color:#15803d}.t-orange{background:#ffedd5;color:#c2410c}.t-red{background:#fee2e2;color:#b91c1c}
+.notes{font-size:13px;color:#334155;background:#f8fafc;border-left:3px solid #cbd5e1;padding:7px 11px;border-radius:4px;margin-top:8px;white-space:pre-wrap}
+.tmpl{margin-top:10px}.tmpl .link{background:#dbeafe;color:#1e40af}.tmpl-label{font-size:11px;color:#64748b;font-weight:700;margin-bottom:5px;text-transform:uppercase;letter-spacing:.04em}
+.editbox{margin-top:10px;padding:10px 12px;background:#fef2f2;border:1px solid #fecaca;border-radius:8px}.editbox .link{background:#fee2e2;color:#991b1b}
 </style></head><body>
 <div id=banner class=banner style=display:none></div>
 <header><h1>PrintReadyArt — My Orders</h1><button class=logout onclick=logout()>Log out</button></header>
@@ -991,36 +1001,41 @@ async function load(){
   else{editsWrap.style.display='none';edits.innerHTML='';}
 }
 function card(o,claimed,isEdit){
-  const files=o.files.map(f=>'<a class=link target=_blank href="'+f.url+'">⬇ '+f.label+'</a>').join('');
-  const sep=(!claimed&&o.separations==='yes')?'<span class=sep>SEPARATIONS</span> ':'';
+  const files=o.files.map(f=>'<a class=link target=_blank href="'+f.url+'">\\u2B07 '+esc(f.label)+'</a>').join('');
   let action='';
-  if(!claimed){action=data.underLimit?'<button class=claim onclick="claim(\\''+o.id+'\\')">Claim</button>':'<span class=tag>at limit</span>';}
-  else if(isEdit&&!o.id){action='<span class=tag>original order not found</span>';}
+  if(!claimed){action=data.underLimit?'<button class=claim onclick="claim(\\''+o.id+'\\')">Claim</button>':'<span class=tag>At limit</span>';}
+  else if(isEdit&&!o.id){action='<span class=tag>Original order not found</span>';}
   else{action='<button class=upload onclick="openUpload(\\''+o.id+'\\')">'+(isEdit?'Upload revised':'Upload completed')+'</button>';}
-  let rich='';
+
+  // Status pill + left accent, both keyed off the SLA clock (claimed/edit cards only).
+  let timer='',accent='u-none';
+  const tsince=(isEdit&&o.edit&&o.edit.created)?o.edit.created:(claimed?o.claimedAt:null);
+  if(claimed&&tsince){
+    const tlabel=isEdit?'edit requested':'claimed';
+    const tc=timerClass(tsince);accent=tc.replace('t-','u-');
+    timer='<div class="timer '+tc+'" data-since="'+tsince+'" data-label="'+tlabel+'">'+elapsedText(tlabel,tsince)+'</div>';
+  }else if(isEdit){accent='u-red';}
+
+  let body='';
   if(claimed){
     const badges=(isEdit?'<span class="badge b-edit">EDIT REQUEST</span>':'')+
-      '<span class="badge b-type">'+esc(o.type||'—')+'</span>'+
+      '<span class="badge b-type">'+esc(o.type||'\\u2014')+'</span>'+
       (o.rush==='yes'?'<span class="badge b-rush">RUSH</span>':'')+
       (o.separations==='yes'?'<span class="badge b-sep">SEPARATIONS</span>':'');
-    const thumb=o.thumb?'<img class=thumb src="'+o.thumb+'" alt="artwork" onerror="this.style.display=\\'none\\'">':'';
-    const tlabel=isEdit?'edit requested':'claimed';
-    const tsince=(isEdit&&o.edit&&o.edit.created)?o.edit.created:o.claimedAt;
-    const timer=tsince?'<div class="timer '+timerClass(tsince)+'" data-since="'+tsince+'" data-label="'+tlabel+'">\\u23F1 '+tlabel+' '+fmtElapsed(tsince)+' ago</div>':'';
+    const thumb=o.thumb?'<div class=cthumb><img src="'+o.thumb+'" alt="artwork" title="Open artwork" onclick="window.open(\\''+o.thumb+'\\',\\'_blank\\')" onerror="this.parentNode.style.display=\\'none\\'"></div>':'';
     const notes=o.specialInstructions?'<div class=notes><b>Special instructions:</b> '+esc(o.specialInstructions)+'</div>':'';
-    // Job-spec blocks: separations detail (any type with Separations=yes) and/or digitizing detail.
     let jobspec='';
     const d=o.details||{};
     const unit=d['cm/in']||d.Unit||'';
     function specRow(label,val){return (val===''||val==null)?'':'<div class=specline><b>'+label+':</b> '+esc(String(val))+'</div>';}
     if(o.separations==='yes'){
-      const body=specRow('Film Size',d.FilmSizeSeps)+specRow('Art Size',d.ArtDims_Seps)+specRow('Art Placement',d.ArtPlacement_Seps)+specRow('Unit',unit);
-      if(body)jobspec+='<div class=spec><div class=spec-label>Separations spec</div>'+body+'</div>';
+      const sb=specRow('Film Size',d.FilmSizeSeps)+specRow('Art Size',d.ArtDims_Seps)+specRow('Art Placement',d.ArtPlacement_Seps)+specRow('Unit',unit);
+      if(sb)jobspec+='<div class=spec><div class=spec-label>Separations spec</div>'+sb+'</div>';
     }
     if((o.type||'').toLowerCase()==='digitizing'){
       const no=d.newOrder||{};
-      const body=specRow('Height',d.Height)+specRow('Width',d.Width)+specRow('Unit',unit)+specRow('3D Puff',no.puff)+specRow('Fabric content',no.fabric)+specRow('Placement',no.placement);
-      if(body)jobspec+='<div class=spec><div class=spec-label>Digitizing spec</div>'+body+'</div>';
+      const db=specRow('Height',d.Height)+specRow('Width',d.Width)+specRow('Unit',unit)+specRow('3D Puff',no.puff)+specRow('Fabric content',no.fabric)+specRow('Placement',no.placement);
+      if(db)jobspec+='<div class=spec><div class=spec-label>Digitizing spec</div>'+db+'</div>';
     }
     let tmpl='';
     if(o.team){
@@ -1032,7 +1047,6 @@ function card(o,claimed,isEdit){
       const ti=instr?'<div class=notes><b>Team instructions:</b> '+esc(instr)+'</div>':'';
       if(tl||ti)tmpl='<div class=tmpl><div class=tmpl-label>Team templates &amp; instructions</div>'+tl+ti+'</div>';
     }
-    // Edit-request detail block: notes, reason, and the client's reference files.
     let editBlock='';
     if(isEdit&&o.edit){
       const refLinks=(o.edit.refs||[]).map(rf=>'<a class=link target=_blank href="'+rf.url+'">\\u2B07 '+esc(rf.label)+'</a>').join('');
@@ -1043,38 +1057,44 @@ function card(o,claimed,isEdit){
         (refLinks?'<div style=margin-top:6px><div class=tmpl-label>Reference files</div>'+refLinks+'</div>':'')+
         '</div>';
     }
-    const orig=isEdit?'<div class=tmpl-label style=margin-top:8px>Original work</div>':'';
-    rich='<div class=cdetails>'+thumb+'<div class=cmeta>'+badges+timer+notes+jobspec+tmpl+editBlock+'</div></div>'+orig;
+    body='<div class=cbody>'+thumb+'<div class=cmeta>'+badges+editBlock+notes+jobspec+tmpl+'</div></div>';
   }
+
   let uploadBox='';
   if(claimed){
     const emb=(o.type||'').toLowerCase()==='digitizing';
     const embFields=emb?(
-      '<div class=tag style=margin-top:8px;color:#b45309;font-weight:600>Digitizing — required:</div>'+
+      '<div class=tag style=margin-top:8px;color:#b45309;font-weight:600>Digitizing \\u2014 required:</div>'+
       '<input id=w'+o.id+' type=number placeholder="Width" style=width:90px>'+
       '<input id=h'+o.id+' type=number placeholder="Height" style=width:90px>'+
       '<input id=sc'+o.id+' type=number placeholder="Stitch count" style=width:120px>'
     ):'';
-    uploadBox='<div id=up'+o.id+' class=uploadbox style="display:none;margin-top:10px;padding:10px;background:#f8fafc;border-radius:8px">'+
-      '<div class=tag>Preview JPEG (before/after) → Image:</div>'+
+    uploadBox='<div id=up'+o.id+' class=uploadbox style="display:none;margin:0 16px 14px;padding:12px;background:#f8fafc;border:1px solid #eef2f6;border-radius:8px">'+
+      '<div class=tag>Preview JPEG (before/after) \\u2192 Image:</div>'+
       '<input id=prev'+o.id+' type=file accept="image/*">'+
       '<div class=tag style=margin-top:8px>Supporting files (replaces existing):</div>'+
       '<input id=sup'+o.id+' type=file multiple>'+
       embFields+
       '<div class=tag style=margin-top:8px>Number of logos in order (required):</div>'+
       '<input id=lg'+o.id+' type=number placeholder="# of logos" style=width:120px>'+
-      '<div style=margin-top:10px><button class=upload onclick="submitUpload(\\''+o.id+'\\','+emb+')">Submit & mark complete</button></div>'+
+      '<div style=margin-top:10px><button class=upload onclick="submitUpload(\\''+o.id+'\\','+emb+')">Submit &amp; mark complete</button></div>'+
       '</div>';
   }
+
   const title=o.ref||('Order '+o.orderNo);
-  const subline=o.ref?('Order '+o.orderNo+' · '+o.type):o.type;
-  return '<div class=card><div class=row><div><span class=ref>'+title+'</span> '+sep+
-    '<div class=tag>'+subline+'</div></div><div>'+action+'</div></div>'+
-    rich+
-    (claimed?('<div style=margin-top:10px>'+files+'</div>'+uploadBox):'')+
-    '</div>';
+  const eyebrow='Order '+esc(o.orderNo||o.id)+(o.type?' \\u00b7 '+esc(o.type):'')+((!claimed&&o.separations==='yes')?' \\u00b7 SEPARATIONS':'');
+  const head='<div class=chead><div><div class=ctitle>'+esc(title)+'</div><div class=eyebrow>'+eyebrow+'</div></div><div>'+timer+'</div></div>';
+  let foot='';
+  if(claimed){
+    const flabel=isEdit?'Original work':'Source files';
+    foot='<div class=cfoot><div class=cfiles>'+(files?('<span class=tag style=margin-right:2px>'+flabel+':</span>'+files):'<span class=tag>No source files</span>')+'</div><div>'+action+'</div></div>';
+  }else{
+    foot='<div class=cfoot><div></div><div>'+action+'</div></div>';
+  }
+  return '<div class="card '+accent+'">'+head+body+foot+uploadBox+'</div>';
 }
 function esc(s){return String(s==null?'':s).replace(/[<>&]/g,function(c){return c==='<'?'&lt;':c==='>'?'&gt;':'&amp;';});}
+function elapsedText(lbl,since){var el=fmtElapsed(since);return '\\u23F1 '+lbl+' '+el+(el==='just now'?'':' ago');}
 function fmtElapsed(since){
   if(!since)return '';
   var ms=Date.now()-new Date(since).getTime();
@@ -1126,7 +1146,7 @@ setInterval(function(){
   document.querySelectorAll('.timer[data-since]').forEach(function(el){
     var s=el.getAttribute('data-since'),lbl=el.getAttribute('data-label')||'claimed';
     el.className='timer '+timerClass(s);
-    el.textContent='\\u23F1 '+lbl+' '+fmtElapsed(s)+' ago';
+    el.textContent=elapsedText(lbl,s);
   });
 },1000);
 load();
