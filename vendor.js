@@ -537,15 +537,6 @@ function mountVendorPortal(app, deps) {
         if (av !== bv) return bv - av;
         return (b.createdHours || 0) - (a.createdHours || 0);
       });
-      const artistRows = artists.map((a) => ({
-        email: String(a.email || "").toLowerCase(), contact: a.contact || "", active: a.is_active_vendor === true,
-        cap: a.max_concurrent_orders, openEditsNow: editsByVendor[String(a.email || "").toLowerCase()] || 0,
-        pending: a.pending_counter, aging: a.aging_counter,
-        ordersToday: a.daily_counter, ordersMonth: a.monthly_counter,
-        editsToday: a.edits_completed_today, editsMonth: a.monthly_edits,
-        orderSpeedToday: a.daily_timer, orderSpeedMonth: a.monthly_timer, editSpeedMonth: a.monthly_edit_timer,
-        editPctToday: a["Edit Percentage Today"], editPctMonth: a["Edit Percentage Month"],
-      })).sort((x, y) => (x.email > y.email ? 1 : -1));
       const knownTypes = ["Vector", "Digitizing", "Digital (DTF/DTG)"];
       const hSinceClaim = (o) => o.claimed_at ? (now - new Date(o.claimed_at).getTime()) / 3600000 : null;
       const totals = {
@@ -559,25 +550,57 @@ function mountVendorPortal(app, deps) {
         digital: pending.filter((o) => o.Order_Type === "Digital (DTF/DTG)").length,
         other: pending.filter((o) => !knownTypes.includes(o.Order_Type)).length,
       };
-      // Today's + this month's throughput (computed, fail-safe — a date-constraint failure won't break the page).
       const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0); const iso = dayStart.toISOString();
       const monStart = new Date(); monStart.setDate(1); monStart.setHours(0, 0, 0, 0); const monIso = monStart.toISOString();
+
+      // ---- Per-vendor computed metrics (from live data, not stored fields) ----
+      const byV = {};
+      const bucket = (email) => {
+        email = String(email || "").toLowerCase(); if (!email) return null;
+        if (!byV[email]) byV[email] = { op: 0, ag: 0, ep: 0, ot: 0, om: 0, et: 0, em: 0, osT: [0, 0], osM: [0, 0], esM: [0, 0] };
+        return byV[email];
+      };
+      const orderSpeedH = (o) => { if (!o.claimed_at || !o["Modified Date"]) return null; const h = (new Date(o["Modified Date"]).getTime() - new Date(o.claimed_at).getTime()) / 3600000; return h >= 0 ? h : null; };
+      const editSpeedH = (e) => { if (!e["Created Date"] || !e.Completed) return null; const h = (new Date(e.Completed).getTime() - new Date(e["Created Date"]).getTime()) / 3600000; return h >= 0 ? h : null; };
+      pending.forEach((o) => { const b = bucket(o[F.assignedArtist]); if (!b) return; b.op++; const h = hSinceClaim(o); if (h != null && h > 8) b.ag++; });
+      openEdits.forEach((e) => { const b = bucket(e.Assigned_Artist); if (b) b.ep++; });
       try {
         const done = await search("uploaded_image", [
           { key: F.claimState, constraint_type: "equals", value: "completed" },
           { key: "Modified Date", constraint_type: "greater than", value: iso }]);
         totals.completedToday = done.length;
+        done.forEach((o) => { const b = bucket(o[F.assignedArtist]); if (!b) return; b.ot++; const h = orderSpeedH(o); if (h != null) { b.osT[0] += h; b.osT[1]++; } });
       } catch (e) { console.warn("[dashboard] completedToday failed:", e.message); totals.completedToday = null; }
-      try {
-        const et = await search("edit_request", [{ key: "Completed", constraint_type: "greater than", value: iso }]);
-        totals.editsToday = et.length;
-      } catch (e) { console.warn("[dashboard] editsToday failed:", e.message); totals.editsToday = null; }
       try {
         const mo = await search("uploaded_image", [
           { key: F.claimState, constraint_type: "equals", value: "completed" },
           { key: "Modified Date", constraint_type: "greater than", value: monIso }]);
         totals.completedMonth = mo.length;
+        mo.forEach((o) => { const b = bucket(o[F.assignedArtist]); if (!b) return; b.om++; const h = orderSpeedH(o); if (h != null) { b.osM[0] += h; b.osM[1]++; } });
       } catch (e) { console.warn("[dashboard] completedMonth failed:", e.message); totals.completedMonth = null; }
+      try {
+        const et = await search("edit_request", [{ key: "Completed", constraint_type: "greater than", value: iso }]);
+        totals.editsToday = et.length;
+        et.forEach((e) => { const b = bucket(e.Assigned_Artist); if (b) b.et++; });
+      } catch (e) { console.warn("[dashboard] editsToday failed:", e.message); totals.editsToday = null; }
+      try {
+        const em = await search("edit_request", [{ key: "Completed", constraint_type: "greater than", value: monIso }]);
+        totals.editsMonth = em.length;
+        em.forEach((e) => { const b = bucket(e.Assigned_Artist); if (!b) return; b.em++; const h = editSpeedH(e); if (h != null) { b.esM[0] += h; b.esM[1]++; } });
+      } catch (e) { console.warn("[dashboard] editsMonth failed:", e.message); totals.editsMonth = null; }
+
+      const avg = (pair) => (pair && pair[1]) ? +(pair[0] / pair[1]).toFixed(2) : null;
+      const artistRows = artists.map((a) => {
+        const em = String(a.email || "").toLowerCase(); const b = byV[em] || {};
+        const om = b.om || 0, emc = b.em || 0;
+        return {
+          email: em, contact: a.contact || "", active: a.is_active_vendor === true, cap: a.max_concurrent_orders,
+          ordersPending: b.op || 0, editsPending: b.ep || 0, aging: b.ag || 0,
+          orderSpeedToday: avg(b.osT), orderSpeedMonth: avg(b.osM), editSpeedMonth: avg(b.esM),
+          editPctMonth: om ? +((emc / om) * 100).toFixed(1) : null,
+          editsToday: b.et || 0, editsMonth: emc, ordersToday: b.ot || 0, ordersMonth: om,
+        };
+      }).sort((x, y) => (x.email > y.email ? 1 : -1));
       const vendors = artists.filter((a) => a.is_active_vendor === true)
         .map((a) => String(a.email || "").toLowerCase()).filter(Boolean).sort();
       res.json({ totals, artists: artistRows, orders, vendors });
@@ -789,6 +812,7 @@ table.stats td.vn,table.stats th.vn{text-align:left}
 .clocks{display:flex;justify-content:space-between;gap:8px;margin-bottom:6px;flex-wrap:wrap}
 .clk{font-weight:800;font-size:12px}.clk2{font-size:12px;color:#94a3b8}
 .age-green .age,.g{color:#16a34a}.age-orange .age,.o{color:#d97706}.age-red .age,.r{color:#dc2626}
+table.stats td.g,table.stats td.o,table.stats td.r{font-weight:700}
 .line{font-size:13px;color:#475569;margin-top:3px}.line b{color:#0f172a}
 .badge{display:inline-block;font-size:10px;font-weight:700;padding:2px 7px;border-radius:999px;margin-right:5px}
 .b-un{background:#fef3c7;color:#92400e}.b-rush{background:#fee2e2;color:#b91c1c}.b-sep{background:#e0e7ff;color:#3730a3}.b-state{background:#f1f5f9;color:#475569}
@@ -847,17 +871,24 @@ function render(){
   renderStats();renderOrders();
 }
 function fmtH(h){if(h==null)return null;if(h>=48)return (h/24).toFixed(1)+'d';return h+'h';}
+function spdClass(v){if(v==null)return '';if(v<5)return 'g';if(v<=10)return 'o';return 'r';}
+function pctClass(v){if(v==null)return '';if(v<10)return 'g';if(v<=15)return 'o';return 'r';}
 function renderStats(){
   const a=DATA.artists||[];
   if(!a.length){document.getElementById('stats').textContent='No vendors.';return;}
-  const cols=[['pending','Orders Pending'],['openEditsNow','Open Edits (live)'],['aging','Aging'],
-    ['orderSpeedToday','Order Spd Today'],['orderSpeedMonth','Order Spd Mo'],['editSpeedMonth','Edit Spd Mo'],
-    ['editPctToday','Edit % Today'],['editPctMonth','Edit % Mo'],
-    ['editsToday','Edits Fin Today'],['editsMonth','Edits Fin Mo'],['ordersToday','Ord Fin Today'],['ordersMonth','Ord Fin Mo'],['cap','Cap']];
-  let h='<table class=stats><tr><th class=vn>Vendor</th>';cols.forEach(function(c){h+='<th>'+c[1]+'</th>';});h+='</tr>';
+  const cols=[['ordersPending','Orders Pending'],['editsPending','Edits Pending'],['aging','Aging Orders'],
+    ['orderSpeedToday','Order Speed Today','spd'],['orderSpeedMonth','Order Speed Month','spd'],['editSpeedMonth','Edit Speed Month','spd'],
+    ['editPctMonth','Edit % Month','pct'],
+    ['editsToday','Edits Finished Today'],['editsMonth','Edits Finished Month'],['ordersToday','Orders Finished Today'],['ordersMonth','Orders Finished Month']];
+  let h='<table class=stats><tr><th class=vn>By Artist</th>';cols.forEach(function(c){h+='<th>'+c[1]+'</th>';});h+='</tr>';
   a.forEach(function(v){
     h+='<tr><td class=vn><span class="dot '+(v.active?'on':'off')+'"></span>'+(v.contact||v.email||'(no email)')+'<div class=osub>'+(v.email||'')+'</div></td>';
-    cols.forEach(function(c){var val=v[c[0]];h+='<td>'+(val==null||val===''?'\u2013':val)+'</td>';});
+    cols.forEach(function(c){
+      var val=v[c[0]];var cls='';
+      if(c[2]==='spd')cls=spdClass(val);else if(c[2]==='pct')cls=pctClass(val);
+      var disp=(val==null||val==='')?'\u2013':(c[2]==='pct'?val+'%':val);
+      h+='<td class="'+cls+'">'+disp+'</td>';
+    });
     h+='</tr>';
   });
   h+='</table>';document.getElementById('stats').innerHTML=h;
