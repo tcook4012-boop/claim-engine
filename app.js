@@ -95,7 +95,9 @@ async function artistByEmail(email) {
   const rows = await search("artist", [{ key: ART.email, constraint_type: "equals", value: email }]);
   const a = rows[0];
   return a ? { email, maxConcurrent: Number(a[ART.maxConcurrent] || 0),
-              capabilities: a[ART.capabilities] || [] } : null;
+              capabilities: a[ART.capabilities] || [],
+              monthlyTimer: a.monthly_timer, monthlyEditTimer: a.monthly_edit_timer,
+              monthlyCount: a.monthly_counter } : null;
 }
 const activeVendors = () =>
   search("artist", [{ key: ART.isActive, constraint_type: "equals", value: YES }])
