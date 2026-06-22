@@ -56,11 +56,14 @@ const YES = true;
 
 function requiredCapsForOrder(o) {
   const caps = [];
-  // Order type -> capability tag. (OFM/PFX routing to be added once we know the field.)
+  // Order type -> capability tag.
   const TYPE_CAP = { "Vector": "vector", "Digitizing": "digitizing", "Digital (DTF/DTG)": "digital_printing" };
   const t = TYPE_CAP[o.Order_Type];
   if (t) caps.push(t);
   if (o[F.separations] === "yes" || o[F.separations] === true) caps.push("separations");
+  // Digitizing OFM/PXF requests -> ofm / pfx capabilities. Field is "PXF"; capability tag is "pfx".
+  if (o.OFM === "yes" || o.OFM === true) caps.push("ofm");
+  if (o.PXF === "yes" || o.PXF === true) caps.push("pfx");
   return caps;
 }
 
