@@ -306,7 +306,7 @@ function mountVendorPortal(app, deps) {
         monthlyTimer: sp.orderSpeed, monthlyEditTimer: sp.editSpeed,
         monthlyCount: sp.ordersMonth, monthlyEdits: sp.editsMonth,
         edits: editViews,
-        claimable: claimable.map((o) => orderView(o)),
+        claimable: claimable.map((o) => ({ id: o._id, orderNo: o["Order#"] || "", type: o.Order_Type || "" })),
         claimed: claimedViews,
       });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -557,12 +557,26 @@ function mountVendorPortal(app, deps) {
       const now = Date.now();
       const editsByVendor = {};
       openEdits.forEach((e) => { const a = String(e.Assigned_Artist || "").toLowerCase(); if (a) editsByVendor[a] = (editsByVendor[a] || 0) + 1; });
+      // An order is only ACTUALLY claimed when claim_state === "claimed". The engine
+      // pre-stamps Assigned_Artist while offering, so we never treat that as claimed.
+      const TYPE_CAP = { "Vector": "vector", "Digitizing": "digitizing", "Digital (DTF/DTG)": "digital_printing" };
+      const reqCapsFor = (o) => {
+        const c = []; const t = TYPE_CAP[o.Order_Type]; if (t) c.push(t);
+        if (o.Separations === "yes") c.push("separations");
+        if (o.OFM === "yes") c.push("ofm");
+        if (o.PXF === "yes") c.push("pfx");
+        return c;
+      };
+      const isClaimed = (o) => (o[F.claimState] || "") === "claimed";
       const orders = pending.map((o) => {
         const created = o["Created Date"] ? (now - new Date(o["Created Date"]).getTime()) / 3600000 : null;
-        const claimed = o.claimed_at ? (now - new Date(o.claimed_at).getTime()) / 3600000 : null;
+        const claimed = (isClaimed(o) && o.claimed_at) ? (now - new Date(o.claimed_at).getTime()) / 3600000 : null;
         return {
           id: o._id, orderNo: o["Order#"] || "", ref: o["Customer_PO#"] || "", type: o.Order_Type || "",
-          user: o.User || "", assigned: String(o[F.assignedArtist] || ""), state: o[F.claimState] || "",
+          user: o.User || "", state: o[F.claimState] || "",
+          assigned: isClaimed(o) ? String(o[F.assignedArtist] || "") : "",
+          offeredTo: !isClaimed(o) ? String(o[F.assignedArtist] || "") : "",
+          reqCaps: reqCapsFor(o),
           thumb: o.image ? (String(o.image).startsWith("//") ? "https:" + o.image : String(o.image)) : "",
           createdHours: created != null ? +created.toFixed(2) : null,
           claimedHours: claimed != null ? +claimed.toFixed(2) : null,
@@ -570,16 +584,15 @@ function mountVendorPortal(app, deps) {
           multiEdit: o["Multiple Edit Alert"] === true,
         };
       }).sort((a, b) => {
-        // Longest-held claimed work first (the actionable SLA clock); then unclaimed by oldest created.
         const av = a.claimedHours != null ? a.claimedHours : -1, bv = b.claimedHours != null ? b.claimedHours : -1;
         if (av !== bv) return bv - av;
         return (b.createdHours || 0) - (a.createdHours || 0);
       });
       const knownTypes = ["Vector", "Digitizing", "Digital (DTF/DTG)"];
-      const hSinceClaim = (o) => o.claimed_at ? (now - new Date(o.claimed_at).getTime()) / 3600000 : null;
+      const hSinceClaim = (o) => (isClaimed(o) && o.claimed_at) ? (now - new Date(o.claimed_at).getTime()) / 3600000 : null;
       const totals = {
         pending: pending.length,
-        unassigned: pending.filter((o) => !o[F.assignedArtist]).length,
+        unassigned: pending.filter((o) => !isClaimed(o)).length,
         openEdits: openEdits.length,
         aging: pending.filter((o) => { const h = hSinceClaim(o); return h != null && h > 8; }).length,
         multiEdit: pending.filter((o) => o["Multiple Edit Alert"] === true).length,
@@ -600,7 +613,7 @@ function mountVendorPortal(app, deps) {
       };
       const orderSpeedH = (o) => { if (!o.claimed_at || !o["Modified Date"]) return null; const h = (new Date(o["Modified Date"]).getTime() - new Date(o.claimed_at).getTime()) / 3600000; return h >= 0 ? h : null; };
       const editSpeedH = (e) => { if (!e["Created Date"] || !e.Completed) return null; const h = (new Date(e.Completed).getTime() - new Date(e["Created Date"]).getTime()) / 3600000; return h >= 0 ? h : null; };
-      pending.forEach((o) => { const b = bucket(o[F.assignedArtist]); if (!b) return; b.op++; const h = hSinceClaim(o); if (h != null && h > 8) b.ag++; });
+      pending.forEach((o) => { if (!isClaimed(o)) return; const b = bucket(o[F.assignedArtist]); if (!b) return; b.op++; const h = hSinceClaim(o); if (h != null && h > 8) b.ag++; });
       openEdits.forEach((e) => { const b = bucket(e.Assigned_Artist); if (b) b.ep++; });
       try {
         const done = await search("uploaded_image", [
@@ -633,6 +646,7 @@ function mountVendorPortal(app, deps) {
         const om = b.om || 0, emc = b.em || 0;
         return {
           email: em, contact: a.contact || "", active: a.is_active_vendor === true, cap: a.max_concurrent_orders,
+          capabilities: Array.isArray(a.capabilities) ? a.capabilities.map((c) => String(c).toLowerCase()) : [],
           ordersPending: b.op || 0, editsPending: b.ep || 0, aging: b.ag || 0,
           orderSpeedToday: avg(b.osT), orderSpeedMonth: avg(b.osM), editSpeedMonth: avg(b.esM),
           editPctMonth: om ? +((emc / om) * 100).toFixed(1) : null,
@@ -871,6 +885,7 @@ table.stats td.g,table.stats td.o,table.stats td.r{font-weight:700}.g{color:#16a
 .pthumb{width:100%;max-height:200px;object-fit:contain;border-radius:8px;border:1px solid #e2e8f0;margin:6px 0;cursor:pointer}
 .specline{font-size:13px;color:#334155;margin:4px 0}.specline b{color:#0f172a}
 .multibanner{display:flex;gap:8px;background:#fee2e2;color:#991b1b;border-radius:8px;padding:9px 12px;font-size:13px;font-weight:700;margin-bottom:12px}
+.eligbox{margin-top:10px;padding:10px 12px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px}
 .uploadwrap{margin-top:16px;border-top:1px solid #eef2f6;padding-top:14px}.uploadwrap .tag{font-size:12px;color:#64748b;display:block;margin-bottom:4px}
 .upload{background:#2563eb;color:#fff;border:0;border-radius:8px;padding:8px 14px;font-size:13px;font-weight:600;cursor:pointer}
 .cancelbtn{background:#fee2e2;color:#b91c1c;border:0;border-radius:8px;padding:8px 14px;font-size:13px;font-weight:600;cursor:pointer}
@@ -988,16 +1003,44 @@ function renderStats(){
     cols.forEach(function(c){var val=v[c[0]];var cls=c[2]==='spd'?spdClass(val):(c[2]==='pct'?pctClass(val):'');var disp=(val==null||val==='')?'\\u2013':(c[2]==='pct'?val+'%':val);h+='<td class="'+cls+'">'+disp+'</td>';});h+='</tr>';});
   h+='</table>';document.getElementById('stats').innerHTML=h;
 }
+function eligibleFor(o){
+  var req=o.reqCaps||[];
+  return (DATA.artists||[]).filter(function(a){
+    if(!a.active)return false;
+    var caps=(a.capabilities||[]).map(function(c){return String(c).toLowerCase();});
+    for(var i=0;i<req.length;i++){if(caps.indexOf(req[i])<0)return false;}
+    return true;
+  }).map(function(a){
+    var load=(a.ordersPending||0)+(a.editsPending||0);
+    var cap=(a.cap==null||a.cap==='')?null:Number(a.cap);
+    return {email:a.email,contact:a.contact,load:load,cap:cap,under:(cap==null||load<cap)};
+  });
+}
+function vendList(arr){
+  if(!arr.length)return '<div style=font-size:13px;color:#94a3b8>none</div>';
+  return arr.map(function(v){return '<div class=specline>'+esc(v.contact||v.email)+' <span style=color:#94a3b8>('+v.load+(v.cap!=null?'/'+v.cap:'')+' load)</span></div>';}).join('');
+}
 function fillPanel(o){
+  var claimed=(o.state==='claimed');
   var badges=(o.type?'<span class="badge b-type">'+esc(o.type)+'</span>':'')+(o.rush==='yes'?'<span class="badge b-rush">RUSH</span>':'')+(o.separations==='yes'?'<span class="badge b-sep">SEPARATIONS</span>':'');
   var multi=o.multiEdit?'<div class=multibanner>\\u26A0 This order has had multiple edits</div>':'';
   var thumb=o.thumb?'<img class=pthumb src="'+o.thumb+'" onclick="window.open(\\''+o.thumb+'\\',\\'_blank\\')" onerror="this.style.display=\\'none\\'">':'';
   var opts=(DATA.vendors||[]).map(function(e){return '<option value="'+e+'"'+(e===o.assigned?' selected':'')+'>'+esc(e)+'</option>';}).join('');
+  var statusBlock;
+  if(claimed){
+    statusBlock='<div class=specline><b>Status:</b> Claimed</div>'+
+      '<div class=specline><b>Assigned:</b> '+esc(o.assigned||'?')+'</div>'+
+      '<div class=specline><b>Claimed:</b> '+(o.claimedHours!=null?fmtH(o.claimedHours)+' ago':'\\u2013')+'</div>';
+  }else{
+    var el=eligibleFor(o);var avail=el.filter(function(v){return v.under;}),fullv=el.filter(function(v){return !v.under;});
+    statusBlock='<div class=specline><b>Status:</b> <span style=color:#b45309;font-weight:700>Unclaimed</span> \\u00b7 waiting '+fmtH(o.createdHours)+' since placed</div>'+
+      (o.offeredTo?'<div class=specline><b>Waiting on (offered to):</b> '+esc(o.offeredTo)+'</div>':'<div class=specline><b>Offered to:</b> not yet offered</div>')+
+      '<div class=eligbox><div class=tmpl-label>Available to claim now'+(o.reqCaps&&o.reqCaps.length?' \\u00b7 needs: '+esc(o.reqCaps.join(', ')):'')+'</div>'+vendList(avail)+
+      (fullv.length?'<div class=tmpl-label style=margin-top:8px>Eligible but at capacity</div>'+vendList(fullv):'')+'</div>';
+  }
   panel.innerHTML='<div class=phead><div><div class=ptitle>Order '+esc(o.orderNo||o.id)+'</div><div class=peyebrow>'+esc(o.type||'')+(o.ref?' \\u00b7 PO '+esc(o.ref):'')+'</div></div><button class=pclose onclick="closeDetail()">\\u2715</button></div>'+
     '<div class=pbody>'+multi+'<div>'+badges+'</div>'+thumb+
-    '<div class=specline><b>Client:</b> '+esc(o.user||'?')+'</div>'+
-    '<div class=specline><b>Assigned:</b> '+(o.assigned?esc(o.assigned):'unassigned')+'</div>'+
-    '<div class=specline><b>Claimed:</b> '+(o.claimedHours!=null?fmtH(o.claimedHours)+' ago':'not claimed')+'</div>'+
+    '<div class=specline><b>Client:</b> '+esc(o.user||'?')+'</div>'+statusBlock+
     '<div class=specline><b>Created:</b> '+(o.createdHours!=null?fmtH(o.createdHours)+' ago':'\\u2013')+'</div>'+
     '<div class=uploadwrap><span class=tag>Assign / reassign to vendor</span><div style=display:flex;gap:8px;flex-wrap:wrap><select id=asgSel>'+(o.assigned?'':'<option value="">choose\\u2026</option>')+opts+'</select>'+
     '<button class=upload onclick="assignOrder(\\''+o.id+'\\')">'+(o.assigned?'Reassign':'Push')+'</button></div>'+
@@ -1039,7 +1082,7 @@ main{max-width:880px;margin:18px auto;padding:0 16px}
 .list{background:#fff;border:1px solid #eef2f6;border-radius:12px;overflow:hidden}
 .row{display:flex;align-items:center;gap:12px;padding:11px 14px;border-bottom:1px solid #f1f5f9;cursor:pointer;transition:background .12s}
 .row:last-child{border-bottom:0}.row:hover{background:#f8fafc}
-.row.av{border-left:3px solid #2563eb}.row.ed{border-left:3px solid #dc2626}
+.row.av{border-left:3px solid #2563eb}.row.ed{border-left:3px solid #dc2626}.row.nopick{cursor:default}.row.nopick:hover{background:#fff}
 .rthumb{width:38px;height:38px;border-radius:8px;object-fit:cover;border:1px solid #e2e8f0;background:#f1f5f9;flex:none}
 .rthumb.ph{display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:17px}
 .rmain{flex:1;min-width:0}
@@ -1128,20 +1171,20 @@ function groupHtml(label,arr,state){
 function phThumb(){return '<div class="rthumb ph">\\u25A1</div>';}
 function shortUser(u){u=String(u);return (u.indexOf('@')>=0||u.length<=16)?u:(u.slice(0,12)+'\\u2026');}
 function rowHtml(o,state){
-  var cls='row'+(state==='available'?' av':'')+(state==='edit'?' ed':'');
+  if(state==='available'){
+    var act=data.underLimit?'<button class=claim onclick="claim(\\''+o.id+'\\')">Claim</button>':'<span style=color:#94a3b8;font-size:13px>At limit</span>';
+    return '<div class="row av nopick"><div class="rthumb ph">\\u25A1</div>'+
+      '<div class=rmain><div class=rtitle>Order '+esc(o.orderNo||o.id)+'<span class="mini m-new">New</span></div><div class=rsub>Waiting to be claimed</div></div>'+
+      '<div class=rtype>'+esc(o.type||'')+'</div><div class=rright>'+act+'</div></div>';
+  }
+  var cls='row'+(state==='edit'?' ed':'');
   var thumb=o.thumb?'<img class=rthumb src="'+o.thumb+'" onerror="this.outerHTML=phThumb()">':phThumb();
   var marks='';
-  if(state==='available')marks+='<span class="mini m-new">New</span>';
   if(o.separations==='yes')marks+='<span class="mini m-sep">Sep</span>';
   if(o.multiEdit)marks+='<span class="mini m-multi">\\u26A0 Multi-edit</span>';
   var sub=(state==='edit')?esc((o.edit&&o.edit.changes)||'Edit requested'):('Order '+esc(o.orderNo)+(o.user?' \\u00b7 '+esc(shortUser(o.user)):''));
-  var right='';
-  if(state==='available'){
-    right=data.underLimit?'<button class=claim onclick="event.stopPropagation();claim(\\''+o.id+'\\')">Claim</button>':'<span style=color:#94a3b8;font-size:13px>At limit</span>';
-  }else{
-    var since=(state==='edit'&&o.edit)?o.edit.created:o.claimedAt;var lbl=state==='edit'?'edit requested':'claimed';
-    if(since)right='<div class="timer '+timerClass(since)+'" data-since="'+since+'" data-label="'+lbl+'">'+elapsedText(lbl,since)+'</div>';
-  }
+  var since=(state==='edit'&&o.edit)?o.edit.created:o.claimedAt;var lbl=state==='edit'?'edit requested':'claimed';
+  var right=since?'<div class="timer '+timerClass(since)+'" data-since="'+since+'" data-label="'+lbl+'">'+elapsedText(lbl,since)+'</div>':'';
   return '<div class="'+cls+'" onclick="openDetail(\\''+o._key+'\\')">'+thumb+
     '<div class=rmain><div class=rtitle>'+esc(o.ref||('Order '+o.orderNo))+marks+'</div><div class=rsub>'+sub+'</div></div>'+
     '<div class=rtype>'+esc(o.type||'')+'</div><div class=rright>'+right+'<i class=chev>\\u203A</i></div></div>';
