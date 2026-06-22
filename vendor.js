@@ -883,7 +883,7 @@ table.stats td.g,table.stats td.o,table.stats td.r{font-weight:700}.g{color:#16a
   <div class=toppanels><div id=totalPanel class=totalpanel></div><div id=tiles class=tiles></div></div>
   <div class=toolbar>
     <label>Sort <select id=sortSel onchange="setSort(this.value)">
-      <option value=held>Time held</option><option value=created>Time created</option><option value=vendor>Vendor</option><option value=type>Type</option><option value=multi>Multiple edits first</option></select></label>
+      <option value=placed>Time since placed</option><option value=held>Time held (claimed)</option><option value=vendor>Vendor</option><option value=type>Type</option><option value=multi>Multiple edits first</option></select></label>
     <label>Vendor <select id=fVendor onchange="setFilter()"><option value="">All</option></select></label>
     <label>State <select id=fState onchange="setFilter()"><option value="">All</option><option value=unassigned>Unassigned</option><option value=assigned>Assigned</option></select></label>
     <label>Type <select id=fType onchange="setFilter()"><option value="">All</option></select></label>
@@ -898,7 +898,7 @@ table.stats td.g,table.stats td.o,table.stats td.r{font-weight:700}.g{color:#16a
 <div id=panel></div>
 <script>
 let DATA={vendors:[],orders:[],artists:[],totals:{}},byId={},panelOpenId=null;
-let sortBy='held',fltVendor='',fltState='',fltType='',fltMulti=false;
+let sortBy='placed',fltVendor='',fltState='',fltType='',fltMulti=false;
 function fmtH(h){if(h==null)return '\\u2013';if(h>=48)return (h/24).toFixed(1)+'d';return h+'h';}
 function ageClass(h){if(h==null)return 't-green';if(h>8)return 't-red';if(h>=6)return 't-orange';return 't-green';}
 function spdClass(v){if(v==null)return '';if(v<5)return 'g';if(v<=10)return 'o';return 'r';}
@@ -932,7 +932,10 @@ function renderTotals(){
 }
 function renderTiles(){
   var t=DATA.totals||{};function tile(n,l,w){return '<div class="tile'+(w&&n?' warn':'')+'"><div class=n>'+(n==null?'0':n)+'</div><div class=l>'+l+'</div></div>';}
-  document.getElementById('tiles').innerHTML=tile(t.unassigned,'Unassigned',true)+tile(t.vector,'Vector')+tile(t.digitizing,'Digitizing')+tile(t.digital,'Digital (DTF/DTG)')+tile(t.other,'Other / unknown',true);
+  var un=(DATA.orders||[]).filter(function(o){return !o.assigned;});
+  var oldest=0;un.forEach(function(o){if(o.createdHours!=null&&o.createdHours>oldest)oldest=o.createdHours;});
+  var oldestTile='<div class="tile'+(un.length?' warn':'')+'"><div class=n>'+(un.length?fmtH(oldest):'\\u2013')+'</div><div class=l>Oldest unclaimed</div></div>';
+  document.getElementById('tiles').innerHTML=tile(t.unassigned,'Unassigned',true)+oldestTile+tile(t.vector,'Vector')+tile(t.digitizing,'Digitizing')+tile(t.digital,'Digital (DTF/DTG)')+tile(t.other,'Other / unknown',true);
 }
 function populateFilters(){
   var vsel=document.getElementById('fVendor');var cur=vsel.value;
@@ -953,7 +956,7 @@ function applyFilter(arr){return arr.filter(function(o){
   if(fltMulti&&!o.multiEdit)return false;
   return true;});}
 function applySort(arr){arr.sort(function(a,b){
-  if(sortBy==='created')return (b.createdHours||0)-(a.createdHours||0);
+  if(sortBy==='placed')return (b.createdHours||0)-(a.createdHours||0);
   if(sortBy==='vendor')return String(a.assigned).localeCompare(String(b.assigned));
   if(sortBy==='type')return String(a.type).localeCompare(String(b.type));
   if(sortBy==='multi'){var m=(b.multiEdit?1:0)-(a.multiEdit?1:0);if(m)return m;}
@@ -968,7 +971,9 @@ function rowHtml(o){
   var thumb=o.thumb?'<img class=rthumb src="'+o.thumb+'" onerror="this.outerHTML=phThumb()">':phThumb();
   var assigned=o.assigned?esc(shortUser(o.assigned)):'<span class="mini m-un">Unassigned</span>';
   var marks=(o.separations==='yes'?'<span class="mini m-sep">Sep</span>':'')+(o.rush==='yes'?'<span class="mini m-rush">Rush</span>':'')+(o.multiEdit?'<span class="mini m-multi">\\u26A0 Multi-edit</span>':'');
-  var pill=o.claimedHours!=null?'<div class="timer '+ageClass(o.claimedHours)+'">'+fmtH(o.claimedHours)+'</div>':'<span style=color:#94a3b8;font-size:12px>unclaimed</span>';
+  var pill=(o.claimedHours!=null)
+    ? '<div class="timer '+ageClass(o.claimedHours)+'" title="Time held since claimed">'+fmtH(o.claimedHours)+'</div>'
+    : '<div class="timer '+ageClass(o.createdHours)+'" title="Unclaimed \\u2014 time since placed">\\u231B '+fmtH(o.createdHours)+'</div>';
   return '<div class="row'+(o.multiEdit?' multi':'')+'" onclick="openDetail(\\''+o.id+'\\')">'+thumb+
     '<div class=rmain><div class=rtitle>Order '+esc(o.orderNo||o.id)+marks+'</div><div class=rsub>'+esc(o.type||'(no type)')+' \\u00b7 '+esc(shortUser(o.user||'?'))+'</div></div>'+
     '<div class=rasg>'+assigned+'</div><div class=rright>'+pill+'<i class=chev>\\u203A</i></div></div>';
