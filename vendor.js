@@ -213,6 +213,38 @@ function mountVendorPortal(app, deps) {
     } catch (e) { console.warn("[orders] new_orders lookup failed for " + orderNo + ":", e.message); return null; }
   }
 
+  // Per-vendor monthly speeds, COMPUTED from claim -> completion (order) and
+  // created -> completed (edit). Cached 5 min so the 30s portal refresh stays cheap.
+  const _speedCache = new Map();
+  const SPEED_TTL = 5 * 60 * 1000;
+  async function monthlySpeeds(email) {
+    const hit = _speedCache.get(email);
+    if (hit && Date.now() - hit.at < SPEED_TTL) return hit;
+    const monStart = new Date(); monStart.setDate(1); monStart.setHours(0, 0, 0, 0);
+    const monIso = monStart.toISOString();
+    let orderSpeed = null, editSpeed = null, ordersMonth = 0, editsMonth = 0;
+    try {
+      const done = await search("uploaded_image", [
+        { key: F.assignedArtist, constraint_type: "equals", value: email },
+        { key: F.claimState, constraint_type: "equals", value: "completed" },
+        { key: "Modified Date", constraint_type: "greater than", value: monIso }]);
+      ordersMonth = done.length; let s = 0, n = 0;
+      done.forEach((o) => { if (o.claimed_at && o["Modified Date"]) { const h = (new Date(o["Modified Date"]).getTime() - new Date(o.claimed_at).getTime()) / 3600000; if (h >= 0) { s += h; n++; } } });
+      orderSpeed = n ? +(s / n).toFixed(1) : null;
+    } catch (e) { console.warn("[orders] monthly order speed failed:", e.message); }
+    try {
+      const em = await search("edit_request", [
+        { key: "Assigned_Artist", constraint_type: "equals", value: email },
+        { key: "Completed", constraint_type: "greater than", value: monIso }]);
+      editsMonth = em.length; let s = 0, n = 0;
+      em.forEach((e) => { if (e["Created Date"] && e.Completed) { const h = (new Date(e.Completed).getTime() - new Date(e["Created Date"]).getTime()) / 3600000; if (h >= 0) { s += h; n++; } } });
+      editSpeed = n ? +(s / n).toFixed(1) : null;
+    } catch (e) { console.warn("[orders] monthly edit speed failed:", e.message); }
+    const out = { at: Date.now(), orderSpeed, editSpeed, ordersMonth, editsMonth };
+    _speedCache.set(email, out);
+    return out;
+  }
+
   app.get("/vendor/api/orders", requireVendor, async (req, res) => {
     try {
       const email = effectiveEmail(req.session);
@@ -267,9 +299,12 @@ function mountVendorPortal(app, deps) {
         };
         return base;
       }));
+      const sp = await monthlySpeeds(email);
       res.json({
         email, limit, openCount: load, claimedCount: mine.length, editCount, underLimit,
         actingAs: req.session.actingAs || null,
+        monthlyTimer: sp.orderSpeed, monthlyEditTimer: sp.editSpeed,
+        monthlyCount: sp.ordersMonth, monthlyEdits: sp.editsMonth,
         edits: editViews,
         claimable: claimable.map((o) => orderView(o)),
         claimed: claimedViews,
@@ -528,9 +563,11 @@ function mountVendorPortal(app, deps) {
         return {
           id: o._id, orderNo: o["Order#"] || "", ref: o["Customer_PO#"] || "", type: o.Order_Type || "",
           user: o.User || "", assigned: String(o[F.assignedArtist] || ""), state: o[F.claimState] || "",
+          thumb: o.image ? (String(o.image).startsWith("//") ? "https:" + o.image : String(o.image)) : "",
           createdHours: created != null ? +created.toFixed(2) : null,
           claimedHours: claimed != null ? +claimed.toFixed(2) : null,
           separations: o[F.separations] || "no", rush: o.Rush || "no",
+          multiEdit: o["Multiple Edit Alert"] === true,
         };
       }).sort((a, b) => {
         // Longest-held claimed work first (the actionable SLA clock); then unclaimed by oldest created.
@@ -780,170 +817,203 @@ load();
 
 const ADMIN_ORDERS_HTML = `<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Orders Dashboard</title><style>
-body{font-family:system-ui,sans-serif;background:#f4f6fa;margin:0;color:#0f172a}
-header{background:#0f172a;color:#fff;padding:14px 20px;display:flex;justify-content:space-between;align-items:center}
+*{box-sizing:border-box}
+body{font-family:system-ui,-apple-system,sans-serif;background:#f4f6fa;margin:0;color:#0f172a}
+header{background:#0f172a;color:#fff;padding:0 20px;height:56px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:20}
 header a{color:#93c5fd;text-decoration:none;margin-left:14px;font-size:14px}
-.wrap{max-width:1280px;margin:18px auto;padding:0 16px}
-.tabs{display:flex;gap:6px;margin-bottom:18px}
-.tab{background:#e2e8f0;color:#334155;border:0;border-radius:8px 8px 0 0;padding:10px 20px;font-weight:700;cursor:pointer;font-size:14px}
+.logout{background:rgba(255,255,255,.18);color:#fff;border:0;border-radius:8px;padding:7px 12px;font-size:13px;font-weight:600;cursor:pointer}
+.wrap{max-width:1180px;margin:16px auto;padding:0 16px}
+.tabs{display:flex;gap:6px;margin-bottom:14px}
+.tab{background:#e2e8f0;color:#334155;border:0;border-radius:8px 8px 0 0;padding:9px 20px;font-weight:700;cursor:pointer;font-size:14px}
 .tab.active{background:#fff;color:#0f172a;box-shadow:0 -2px 0 #2563eb inset}
-.stat-group{margin-bottom:8px;font-size:12px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.04em}
-.totalpanel{background:#fff;border-radius:12px;padding:18px 22px;box-shadow:0 1px 3px rgba(0,0,0,.08);margin-bottom:18px;max-width:380px}
-.totalpanel h3{color:#2563eb;margin:0 0 10px;font-size:20px}
-.totalpanel .row{font-size:17px;font-weight:700;margin:6px 0}
-.totalpanel .row span{font-weight:800}
-.tp-red{color:#dc2626}.tp-orange{color:#d97706}
-.totals{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:18px}
-.tcard{background:#fff;border-radius:10px;padding:12px 16px;box-shadow:0 1px 3px rgba(0,0,0,.08);min-width:110px}
-.tcard .n{font-size:22px;font-weight:800}.tcard .l{font-size:12px;color:#64748b}
-.t-warn .n{color:#dc2626}.t-day{background:#0f172a}.t-day .n{color:#fff}.t-day .l{color:#94a3b8}
+.toppanels{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:14px}
+.totalpanel{background:#fff;border-radius:12px;padding:16px 20px;box-shadow:0 1px 3px rgba(0,0,0,.08);min-width:300px}
+.totalpanel h3{color:#2563eb;margin:0 0 8px;font-size:18px}
+.totalpanel .r{font-size:15px;font-weight:700;margin:5px 0}.totalpanel .r span{font-weight:800}
+.tp-red{color:#dc2626}.tp-orange{color:#d97706}.tp-click{cursor:pointer}.tp-click:hover{text-decoration:underline}
+.tiles{display:flex;flex-wrap:wrap;gap:10px;align-content:flex-start;flex:1}
+.tile{background:#fff;border-radius:10px;padding:11px 15px;box-shadow:0 1px 3px rgba(0,0,0,.08);min-width:96px}
+.tile .n{font-size:20px;font-weight:800}.tile .l{font-size:12px;color:#64748b}.tile.warn .n{color:#dc2626}
+.toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;background:#fff;border:1px solid #eef2f6;border-radius:10px;padding:10px 12px;margin-bottom:12px}
+.toolbar label{font-size:12px;color:#64748b;display:flex;align-items:center;gap:5px}
+select,input{padding:6px 8px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px}
+.list{background:#fff;border:1px solid #eef2f6;border-radius:12px;overflow:hidden}
+.row{display:flex;align-items:center;gap:12px;padding:10px 14px;border-bottom:1px solid #f1f5f9;cursor:pointer;transition:background .12s}
+.row:last-child{border-bottom:0}.row:hover{background:#f8fafc}.row.multi{border-left:3px solid #dc2626}
+.rthumb{width:36px;height:36px;border-radius:8px;object-fit:cover;border:1px solid #e2e8f0;background:#f1f5f9;flex:none}
+.rthumb.ph{display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:16px}
+.rmain{flex:1;min-width:0}.rtitle{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rsub{font-size:12px;color:#64748b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rasg{width:150px;flex:none;font-size:13px;color:#475569;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rright{flex:none;display:flex;align-items:center;gap:8px}
+.mini{font-size:10px;font-weight:700;padding:1px 7px;border-radius:999px;margin-left:5px}
+.m-sep{background:#fef3c7;color:#92400e}.m-rush{background:#fee2e2;color:#b91c1c}.m-multi{background:#fee2e2;color:#b91c1c}.m-un{background:#fef3c7;color:#92400e}
+.timer{display:inline-flex;align-items:center;font-size:11px;font-weight:700;padding:3px 9px;border-radius:999px;white-space:nowrap}
+.t-green{background:#dcfce7;color:#15803d}.t-orange{background:#ffedd5;color:#c2410c}.t-red{background:#fee2e2;color:#b91c1c}
+.chev{color:#cbd5e1;font-size:18px;font-style:normal}
+.osub{color:#64748b;font-size:12px}.muted{color:#94a3b8;font-size:14px;padding:24px;text-align:center}
 .statwrap{overflow-x:auto}
 table.stats{border-collapse:collapse;width:100%;background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.08);font-size:13px}
 table.stats th,table.stats td{padding:8px 10px;border-bottom:1px solid #eef2f6;text-align:center;white-space:nowrap}
-table.stats th{background:#f1f5f9;color:#334155;font-weight:700}
-table.stats td.vn,table.stats th.vn{text-align:left}
+table.stats th{background:#f1f5f9;color:#334155;font-weight:700}table.stats td.vn,table.stats th.vn{text-align:left}
+table.stats td.g,table.stats td.o,table.stats td.r{font-weight:700}.g{color:#16a34a}.o{color:#d97706}.r{color:#dc2626}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}.on{background:#16a34a}.off{background:#cbd5e1}
-.osub{color:#64748b;font-size:12px}
-.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
-@media(max-width:900px){.grid{grid-template-columns:repeat(2,1fr)}}
-@media(max-width:600px){.grid{grid-template-columns:1fr}}
-.ocard{background:#fff;border-radius:10px;padding:14px;box-shadow:0 1px 3px rgba(0,0,0,.07);border-left:5px solid #cbd5e1}
-.ocard.age-green{border-left-color:#16a34a}.ocard.age-orange{border-left-color:#d97706}.ocard.age-red{border-left-color:#dc2626}
-.ono{font-weight:700;font-size:15px}.age{font-weight:800;font-size:13px;float:right}
-.clocks{display:flex;justify-content:space-between;gap:8px;margin-bottom:6px;flex-wrap:wrap}
-.clk{font-weight:800;font-size:12px}.clk2{font-size:12px;color:#94a3b8}
-.age-green .age,.g{color:#16a34a}.age-orange .age,.o{color:#d97706}.age-red .age,.r{color:#dc2626}
-table.stats td.g,table.stats td.o,table.stats td.r{font-weight:700}
-.line{font-size:13px;color:#475569;margin-top:3px}.line b{color:#0f172a}
-.badge{display:inline-block;font-size:10px;font-weight:700;padding:2px 7px;border-radius:999px;margin-right:5px}
-.b-un{background:#fef3c7;color:#92400e}.b-rush{background:#fee2e2;color:#b91c1c}.b-sep{background:#e0e7ff;color:#3730a3}.b-state{background:#f1f5f9;color:#475569}
-.oact{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:12px}
-select,input{padding:6px 7px;border:1px solid #cbd5e1;border-radius:6px;font-size:12px}
-button{border:0;border-radius:8px;padding:6px 11px;font-weight:600;cursor:pointer;font-size:12px}
-.assign{background:#2563eb;color:#fff}.cancel{background:#fee2e2;color:#b91c1c}.logout{background:rgba(255,255,255,.2);color:#fff}
-.msg{font-size:11px;margin-left:4px}
+#backdrop{position:fixed;inset:0;background:rgba(15,23,42,.45);opacity:0;pointer-events:none;transition:opacity .2s;z-index:40}
+#backdrop.open{opacity:1;pointer-events:auto}
+#panel{position:fixed;top:0;right:0;height:100%;width:460px;max-width:100%;background:#fff;transform:translateX(100%);transition:transform .25s ease;z-index:50;overflow-y:auto}
+#panel.open{transform:translateX(0)}@media(max-width:560px){#panel{width:100%}}
+.phead{position:sticky;top:0;background:#fff;border-bottom:1px solid #eef2f6;padding:16px 18px;display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+.ptitle{font-size:18px;font-weight:700}.peyebrow{font-size:11px;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;margin-top:4px;font-weight:600}
+.pclose{background:#f1f5f9;border:0;border-radius:8px;width:32px;height:32px;cursor:pointer;font-size:15px;color:#475569;flex:none}
+.pbody{padding:16px 18px 28px}
+.badge{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;margin:0 5px 6px 0}
+.b-type{background:#eef2ff;color:#3730a3}.b-rush{background:#fee2e2;color:#b91c1c}.b-sep{background:#fef3c7;color:#92400e}
+.pthumb{width:100%;max-height:200px;object-fit:contain;border-radius:8px;border:1px solid #e2e8f0;margin:6px 0;cursor:pointer}
+.specline{font-size:13px;color:#334155;margin:4px 0}.specline b{color:#0f172a}
+.multibanner{display:flex;gap:8px;background:#fee2e2;color:#991b1b;border-radius:8px;padding:9px 12px;font-size:13px;font-weight:700;margin-bottom:12px}
+.uploadwrap{margin-top:16px;border-top:1px solid #eef2f6;padding-top:14px}.uploadwrap .tag{font-size:12px;color:#64748b;display:block;margin-bottom:4px}
+.upload{background:#2563eb;color:#fff;border:0;border-radius:8px;padding:8px 14px;font-size:13px;font-weight:600;cursor:pointer}
+.cancelbtn{background:#fee2e2;color:#b91c1c;border:0;border-radius:8px;padding:8px 14px;font-size:13px;font-weight:600;cursor:pointer}
 </style></head><body>
 <header><div><b>Orders Dashboard</b><a href="/vendor/admin">Vendor logins</a><a href="/vendor/admin/controls">Vendor controls</a></div>
 <button class=logout onclick="logout()">Log out</button></header>
 <div class=wrap>
 <div class=tabs><button class="tab active" id=tabOrders onclick="showTab('orders')">Orders</button><button class=tab id=tabVendors onclick="showTab('vendors')">By Vendor</button></div>
 <div id=paneOrders>
-  <div id=totalPanel class=totalpanel></div>
-  <div class=stat-group>By type</div>
-  <div id=totalsType class=totals></div>
-  <div class=stat-group>Pending orders &mdash; longest-held first <span id=ocount class=osub></span></div>
-  <div id=orders class=grid></div>
+  <div class=toppanels><div id=totalPanel class=totalpanel></div><div id=tiles class=tiles></div></div>
+  <div class=toolbar>
+    <label>Sort <select id=sortSel onchange="setSort(this.value)">
+      <option value=held>Time held</option><option value=created>Time created</option><option value=vendor>Vendor</option><option value=type>Type</option><option value=multi>Multiple edits first</option></select></label>
+    <label>Vendor <select id=fVendor onchange="setFilter()"><option value="">All</option></select></label>
+    <label>State <select id=fState onchange="setFilter()"><option value="">All</option><option value=unassigned>Unassigned</option><option value=assigned>Assigned</option></select></label>
+    <label>Type <select id=fType onchange="setFilter()"><option value="">All</option></select></label>
+    <label><input type=checkbox id=fMulti onchange="setFilter()"> Multiple edits only</label>
+    <span id=lcount class=osub></span>
+  </div>
+  <div id=orders class=list></div>
 </div>
-<div id=paneVendors style=display:none>
-  <div class=stat-group>Vendor-level data (stored metrics)</div>
-  <div class=statwrap><div id=stats></div></div>
+<div id=paneVendors style=display:none><div class=statwrap><div id=stats></div></div></div>
 </div>
-</div>
+<div id=backdrop onclick="closeDetail()"></div>
+<div id=panel></div>
 <script>
-let DATA={vendors:[]};
+let DATA={vendors:[],orders:[],artists:[],totals:{}},byId={},panelOpenId=null;
+let sortBy='held',fltVendor='',fltState='',fltType='',fltMulti=false;
+function fmtH(h){if(h==null)return '\\u2013';if(h>=48)return (h/24).toFixed(1)+'d';return h+'h';}
+function ageClass(h){if(h==null)return 't-green';if(h>8)return 't-red';if(h>=6)return 't-orange';return 't-green';}
+function spdClass(v){if(v==null)return '';if(v<5)return 'g';if(v<=10)return 'o';return 'r';}
+function pctClass(v){if(v==null)return '';if(v<10)return 'g';if(v<=15)return 'o';return 'r';}
+function esc(s){return String(s==null?'':s).replace(/[<>&]/g,function(c){return c==='<'?'&lt;':c==='>'?'&gt;':'&amp;';});}
+function shortUser(u){u=String(u);return (u.indexOf('@')>=0||u.length<=18)?u:(u.slice(0,14)+'\\u2026');}
+function phThumb(){return '<div class="rthumb ph">\\u25A1</div>';}
 function showTab(t){
   document.getElementById('paneOrders').style.display=t==='orders'?'block':'none';
   document.getElementById('paneVendors').style.display=t==='vendors'?'block':'none';
   document.getElementById('tabOrders').classList.toggle('active',t==='orders');
   document.getElementById('tabVendors').classList.toggle('active',t==='vendors');
 }
-function ageClass(h){if(h==null)return '';if(h>8)return 'age-red';if(h>=6)return 'age-orange';return 'age-green';}
 async function load(){
-  try{const r=await fetch('/vendor/api/admin/dashboard');DATA=await r.json();render();}
-  catch(e){document.getElementById('orders').textContent='Failed to load dashboard.';}
+  try{const r=await fetch('/vendor/api/admin/dashboard');DATA=await r.json();}
+  catch(e){document.getElementById('orders').innerHTML='<div class=muted>Failed to load.</div>';return;}
+  byId={};(DATA.orders||[]).forEach(function(o){byId[o.id]=o;});
+  populateFilters();renderTotals();renderTiles();renderList();renderStats();
+  if(panelOpenId&&byId[panelOpenId])fillPanel(byId[panelOpenId]);
 }
-function tcard(n,l,cls){return '<div class="tcard'+(cls?' '+cls:'')+'"><div class=n>'+(n==null?'\u2013':n)+'</div><div class=l>'+l+'</div></div>';}
-function render(){
-  const t=DATA.totals||{};
-  const v=function(n){return n==null?'\u2013':n;};
-  document.getElementById('totalPanel').innerHTML=
-    '<h3>Total</h3>'+
-    '<div class=row>Pending Orders: <span>'+v(t.pending)+'</span></div>'+
-    '<div class="row tp-red">Aging Orders: <span>'+v(t.aging)+'</span></div>'+
-    '<div class=row>Edits Pending: <span>'+v(t.openEdits)+'</span></div>'+
-    '<div class="row tp-orange">Multiple Edit Alerts: <span>'+v(t.multiEdit)+'</span></div>'+
-    '<div class=row>Edits Completed Today: <span>'+v(t.editsToday)+'</span></div>'+
-    '<div class=row>Orders Completed Today: <span>'+v(t.completedToday)+'</span></div>'+
-    '<div class=row>Orders Completed This Month: <span>'+v(t.completedMonth)+'</span></div>';
-  document.getElementById('totalsType').innerHTML=
-    tcard(t.unassigned,'Unassigned',t.unassigned?'t-warn':'')+
-    tcard(t.vector,'Vector')+tcard(t.digitizing,'Digitizing')+tcard(t.digital,'Digital (DTF/DTG)')+
-    tcard(t.other,'Other / unknown',t.other?'t-warn':'');
-  renderStats();renderOrders();
+function renderTotals(){
+  var t=DATA.totals||{};var v=function(n){return n==null?'0':n;};
+  document.getElementById('totalPanel').innerHTML='<h3>Total</h3>'+
+    '<div class=r>Pending Orders: <span>'+v(t.pending)+'</span></div>'+
+    '<div class="r tp-red">Aging Orders: <span>'+v(t.aging)+'</span></div>'+
+    '<div class=r>Edits Pending: <span>'+v(t.openEdits)+'</span></div>'+
+    '<div class="r tp-orange tp-click" onclick="filterMulti()">Multiple Edit Alerts: <span>'+v(t.multiEdit)+'</span></div>'+
+    '<div class=r>Edits Completed Today: <span>'+v(t.editsToday)+'</span></div>'+
+    '<div class=r>Orders Completed Today: <span>'+v(t.completedToday)+'</span></div>'+
+    '<div class=r>Orders Completed This Month: <span>'+v(t.completedMonth)+'</span></div>';
 }
-function fmtH(h){if(h==null)return null;if(h>=48)return (h/24).toFixed(1)+'d';return h+'h';}
-function spdClass(v){if(v==null)return '';if(v<5)return 'g';if(v<=10)return 'o';return 'r';}
-function pctClass(v){if(v==null)return '';if(v<10)return 'g';if(v<=15)return 'o';return 'r';}
+function renderTiles(){
+  var t=DATA.totals||{};function tile(n,l,w){return '<div class="tile'+(w&&n?' warn':'')+'"><div class=n>'+(n==null?'0':n)+'</div><div class=l>'+l+'</div></div>';}
+  document.getElementById('tiles').innerHTML=tile(t.unassigned,'Unassigned',true)+tile(t.vector,'Vector')+tile(t.digitizing,'Digitizing')+tile(t.digital,'Digital (DTF/DTG)')+tile(t.other,'Other / unknown',true);
+}
+function populateFilters(){
+  var vsel=document.getElementById('fVendor');var cur=vsel.value;
+  var vs=(DATA.vendors||[]).slice();(DATA.orders||[]).forEach(function(o){if(o.assigned&&vs.indexOf(o.assigned)<0)vs.push(o.assigned);});
+  vsel.innerHTML='<option value="">All</option>'+vs.map(function(e){return '<option value="'+e+'">'+esc(shortUser(e))+'</option>';}).join('');vsel.value=cur;
+  var tsel=document.getElementById('fType');var curt=tsel.value;var types=[];
+  (DATA.orders||[]).forEach(function(o){var tp=o.type||'(none)';if(types.indexOf(tp)<0)types.push(tp);});
+  tsel.innerHTML='<option value="">All</option>'+types.map(function(tp){return '<option value="'+esc(tp)+'">'+esc(tp)+'</option>';}).join('');tsel.value=curt;
+}
+function setSort(v){sortBy=v;renderList();}
+function setFilter(){fltVendor=document.getElementById('fVendor').value;fltState=document.getElementById('fState').value;fltType=document.getElementById('fType').value;fltMulti=document.getElementById('fMulti').checked;renderList();}
+function filterMulti(){document.getElementById('fMulti').checked=true;showTab('orders');setFilter();}
+function applyFilter(arr){return arr.filter(function(o){
+  if(fltVendor&&o.assigned!==fltVendor)return false;
+  if(fltState==='unassigned'&&o.assigned)return false;
+  if(fltState==='assigned'&&!o.assigned)return false;
+  if(fltType&&(o.type||'(none)')!==fltType)return false;
+  if(fltMulti&&!o.multiEdit)return false;
+  return true;});}
+function applySort(arr){arr.sort(function(a,b){
+  if(sortBy==='created')return (b.createdHours||0)-(a.createdHours||0);
+  if(sortBy==='vendor')return String(a.assigned).localeCompare(String(b.assigned));
+  if(sortBy==='type')return String(a.type).localeCompare(String(b.type));
+  if(sortBy==='multi'){var m=(b.multiEdit?1:0)-(a.multiEdit?1:0);if(m)return m;}
+  var av=a.claimedHours!=null?a.claimedHours:-1,bv=b.claimedHours!=null?b.claimedHours:-1;return bv-av;});return arr;}
+function renderList(){
+  var arr=applySort(applyFilter((DATA.orders||[]).slice()));
+  document.getElementById('lcount').textContent=arr.length+' shown';
+  if(!arr.length){document.getElementById('orders').innerHTML='<div class=muted>No orders match.</div>';return;}
+  document.getElementById('orders').innerHTML=arr.map(rowHtml).join('');
+}
+function rowHtml(o){
+  var thumb=o.thumb?'<img class=rthumb src="'+o.thumb+'" onerror="this.outerHTML=phThumb()">':phThumb();
+  var assigned=o.assigned?esc(shortUser(o.assigned)):'<span class="mini m-un">Unassigned</span>';
+  var marks=(o.separations==='yes'?'<span class="mini m-sep">Sep</span>':'')+(o.rush==='yes'?'<span class="mini m-rush">Rush</span>':'')+(o.multiEdit?'<span class="mini m-multi">\\u26A0 Multi-edit</span>':'');
+  var pill=o.claimedHours!=null?'<div class="timer '+ageClass(o.claimedHours)+'">'+fmtH(o.claimedHours)+'</div>':'<span style=color:#94a3b8;font-size:12px>unclaimed</span>';
+  return '<div class="row'+(o.multiEdit?' multi':'')+'" onclick="openDetail(\\''+o.id+'\\')">'+thumb+
+    '<div class=rmain><div class=rtitle>Order '+esc(o.orderNo||o.id)+marks+'</div><div class=rsub>'+esc(o.type||'(no type)')+' \\u00b7 '+esc(shortUser(o.user||'?'))+'</div></div>'+
+    '<div class=rasg>'+assigned+'</div><div class=rright>'+pill+'<i class=chev>\\u203A</i></div></div>';
+}
 function renderStats(){
-  const a=DATA.artists||[];
-  if(!a.length){document.getElementById('stats').textContent='No vendors.';return;}
-  const cols=[['ordersPending','Orders Pending'],['editsPending','Edits Pending'],['aging','Aging Orders'],
+  var a=DATA.artists||[];if(!a.length){document.getElementById('stats').textContent='No vendors.';return;}
+  var cols=[['ordersPending','Orders Pending'],['editsPending','Edits Pending'],['aging','Aging Orders'],
     ['orderSpeedToday','Order Speed Today','spd'],['orderSpeedMonth','Order Speed Month','spd'],['editSpeedMonth','Edit Speed Month','spd'],
-    ['editPctMonth','Edit % Month','pct'],
-    ['editsToday','Edits Finished Today'],['editsMonth','Edits Finished Month'],['ordersToday','Orders Finished Today'],['ordersMonth','Orders Finished Month']];
-  let h='<table class=stats><tr><th class=vn>By Artist</th>';cols.forEach(function(c){h+='<th>'+c[1]+'</th>';});h+='</tr>';
-  a.forEach(function(v){
-    h+='<tr><td class=vn><span class="dot '+(v.active?'on':'off')+'"></span>'+(v.contact||v.email||'(no email)')+'<div class=osub>'+(v.email||'')+'</div></td>';
-    cols.forEach(function(c){
-      var val=v[c[0]];var cls='';
-      if(c[2]==='spd')cls=spdClass(val);else if(c[2]==='pct')cls=pctClass(val);
-      var disp=(val==null||val==='')?'\u2013':(c[2]==='pct'?val+'%':val);
-      h+='<td class="'+cls+'">'+disp+'</td>';
-    });
-    h+='</tr>';
-  });
+    ['editPctMonth','Edit % Month','pct'],['editsToday','Edits Finished Today'],['editsMonth','Edits Finished Month'],['ordersToday','Orders Finished Today'],['ordersMonth','Orders Finished Month']];
+  var h='<table class=stats><tr><th class=vn>By Artist</th>';cols.forEach(function(c){h+='<th>'+c[1]+'</th>';});h+='</tr>';
+  a.forEach(function(v){h+='<tr><td class=vn><span class="dot '+(v.active?'on':'off')+'"></span>'+esc(v.contact||v.email||'(no email)')+'<div class=osub>'+esc(v.email||'')+'</div></td>';
+    cols.forEach(function(c){var val=v[c[0]];var cls=c[2]==='spd'?spdClass(val):(c[2]==='pct'?pctClass(val):'');var disp=(val==null||val==='')?'\\u2013':(c[2]==='pct'?val+'%':val);h+='<td class="'+cls+'">'+disp+'</td>';});h+='</tr>';});
   h+='</table>';document.getElementById('stats').innerHTML=h;
 }
-function renderOrders(){
-  const o=DATA.orders||[];
-  document.getElementById('ocount').textContent='('+o.length+')';
-  if(!o.length){document.getElementById('orders').innerHTML='<div class=osub>No pending orders.</div>';return;}
-  const opts=(DATA.vendors||[]).map(function(e){return '<option value="'+e+'">'+e+'</option>';}).join('');
-  document.getElementById('orders').innerHTML=o.map(function(x){
-    const agec=ageClass(x.claimedHours);
-    const assigned=x.assigned?('<b>Artist:</b> '+x.assigned):'<span class="badge b-un">UNASSIGNED</span>';
-    const badges=(x.rush==='yes'?'<span class="badge b-rush">RUSH</span>':'')+(x.separations==='yes'?'<span class="badge b-sep">SEPS</span>':'')+(x.state?'<span class="badge b-state">'+x.state+'</span>':'');
-    const claimedTxt=x.claimedHours==null?'not claimed':('claimed '+fmtH(x.claimedHours)+' ago');
-    const createdTxt=x.createdHours==null?'':('created '+fmtH(x.createdHours)+' ago');
-    return '<div class="ocard '+agec+'" data-id="'+x.id+'">'+
-      '<div class=clocks><span class="clk '+agec+'">\u23f1 '+claimedTxt+'</span><span class=clk2>'+createdTxt+'</span></div>'+
-      '<div class=ono>Order # '+(x.orderNo||x.id)+'</div>'+
-      '<div class=line>'+(x.type||'(no type)')+'</div>'+
-      (x.ref?'<div class=line><b>PO:</b> '+x.ref+'</div>':'')+
-      '<div class=line><b>Client:</b> '+(x.user||'?')+'</div>'+
-      '<div class=line>'+assigned+'</div>'+
-      '<div style=margin-top:8px>'+badges+'</div>'+
-      '<div class=oact><select class=vsel>'+(x.assigned?'':'<option value="">choose vendor\u2026</option>')+opts+'</select>'+
-      '<button class=assign>'+(x.assigned?'Reassign':'Push')+'</button>'+
-      '<button class=cancel>Cancel</button><span class=msg></span></div></div>';
-  }).join('');
-  o.forEach(function(x){if(x.assigned){const sel=document.querySelector('.ocard[data-id="'+x.id+'"] .vsel');if(sel)sel.value=x.assigned;}});
-  document.getElementById('orders').addEventListener('click',onAction);
+function fillPanel(o){
+  var badges=(o.type?'<span class="badge b-type">'+esc(o.type)+'</span>':'')+(o.rush==='yes'?'<span class="badge b-rush">RUSH</span>':'')+(o.separations==='yes'?'<span class="badge b-sep">SEPARATIONS</span>':'');
+  var multi=o.multiEdit?'<div class=multibanner>\\u26A0 This order has had multiple edits</div>':'';
+  var thumb=o.thumb?'<img class=pthumb src="'+o.thumb+'" onclick="window.open(\\''+o.thumb+'\\',\\'_blank\\')" onerror="this.style.display=\\'none\\'">':'';
+  var opts=(DATA.vendors||[]).map(function(e){return '<option value="'+e+'"'+(e===o.assigned?' selected':'')+'>'+esc(e)+'</option>';}).join('');
+  panel.innerHTML='<div class=phead><div><div class=ptitle>Order '+esc(o.orderNo||o.id)+'</div><div class=peyebrow>'+esc(o.type||'')+(o.ref?' \\u00b7 PO '+esc(o.ref):'')+'</div></div><button class=pclose onclick="closeDetail()">\\u2715</button></div>'+
+    '<div class=pbody>'+multi+'<div>'+badges+'</div>'+thumb+
+    '<div class=specline><b>Client:</b> '+esc(o.user||'?')+'</div>'+
+    '<div class=specline><b>Assigned:</b> '+(o.assigned?esc(o.assigned):'unassigned')+'</div>'+
+    '<div class=specline><b>Claimed:</b> '+(o.claimedHours!=null?fmtH(o.claimedHours)+' ago':'not claimed')+'</div>'+
+    '<div class=specline><b>Created:</b> '+(o.createdHours!=null?fmtH(o.createdHours)+' ago':'\\u2013')+'</div>'+
+    '<div class=uploadwrap><span class=tag>Assign / reassign to vendor</span><div style=display:flex;gap:8px;flex-wrap:wrap><select id=asgSel>'+(o.assigned?'':'<option value="">choose\\u2026</option>')+opts+'</select>'+
+    '<button class=upload onclick="assignOrder(\\''+o.id+'\\')">'+(o.assigned?'Reassign':'Push')+'</button></div>'+
+    '<div style=margin-top:14px><button class=cancelbtn onclick="cancelOrder(\\''+o.id+'\\')">Cancel order</button></div><span id=pmsg class=tag style=display:block;margin-top:8px></span></div></div>';
 }
-async function onAction(e){
-  const card=e.target.closest('.ocard');if(!card)return;
-  const id=card.getAttribute('data-id');const msg=card.querySelector('.msg');
-  if(e.target.classList.contains('assign')){
-    const email=card.querySelector('.vsel').value;
-    if(!email){msg.textContent='Pick a vendor';msg.style.color='#dc2626';return;}
-    msg.textContent='Assigning\u2026';msg.style.color='#64748b';
-    await post('/vendor/api/admin/assign-order',{id:id,email:email},msg,'Assigned \u2713');
-  }else if(e.target.classList.contains('cancel')){
-    if(!confirm('Cancel this order? It will stop rotating and leave all queues.'))return;
-    msg.textContent='Cancelling\u2026';msg.style.color='#64748b';
-    await post('/vendor/api/admin/cancel-order',{id:id},msg,'Cancelled \u2713');
-  }
+function openDetail(id){var o=byId[id];if(!o)return;panelOpenId=id;fillPanel(o);panel.classList.add('open');backdrop.classList.add('open');}
+function closeDetail(){panelOpenId=null;panel.classList.remove('open');backdrop.classList.remove('open');load();}
+function assignOrder(id){
+  var email=document.getElementById('asgSel').value;var msg=document.getElementById('pmsg');
+  if(!email){msg.textContent='Pick a vendor';msg.style.color='#dc2626';return;}
+  msg.textContent='Assigning\\u2026';msg.style.color='#64748b';
+  fetch('/vendor/api/admin/assign-order',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id,email:email})}).then(function(r){return r.json();}).then(function(j){if(j.ok){closeDetail();}else{msg.textContent='Error: '+(j.error||'failed');msg.style.color='#dc2626';}});
 }
-async function post(url,body,msg,okText){
-  try{
-    const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    const j=await r.json();
-    if(j.ok){msg.textContent=okText;msg.style.color='#16a34a';setTimeout(load,700);}
-    else{msg.textContent='Error: '+(j.error||'failed');msg.style.color='#dc2626';}
-  }catch(e){msg.textContent='Error';msg.style.color='#dc2626';}
+function cancelOrder(id){
+  if(!confirm('Cancel this order? It stops rotating and leaves all queues.'))return;
+  var msg=document.getElementById('pmsg');msg.textContent='Cancelling\\u2026';msg.style.color='#64748b';
+  fetch('/vendor/api/admin/cancel-order',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})}).then(function(r){return r.json();}).then(function(j){if(j.ok){closeDetail();}else{msg.textContent='Error: '+(j.error||'failed');msg.style.color='#dc2626';}});
 }
 async function logout(){await fetch('/vendor/api/logout',{method:'POST'});location.href='/vendor/login';}
 load();
+setInterval(function(){if(!panelOpenId)load();},30000);
 </script></body></html>`;
 
 const PORTAL_HTML = `<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1">
@@ -956,6 +1026,7 @@ header h1{font-size:16px;margin:0;font-weight:600}
 .chips{display:flex;gap:7px;align-items:center}
 .chip{font-size:12px;font-weight:600;padding:4px 11px;border-radius:999px;background:rgba(255,255,255,.12);color:#cbd5e1}
 .chip.info{background:#dbeafe;color:#1e40af}.chip.danger{background:#fee2e2;color:#b91c1c}.chip.zero{opacity:.45}
+.chip.slots{background:#1e293b;color:#cbd5e1}.chip.slots.full{background:#fee2e2;color:#b91c1c}
 .logout{background:rgba(255,255,255,.18);color:#fff;border:0;border-radius:8px;padding:7px 12px;font-size:13px;font-weight:600;cursor:pointer;margin-left:6px}
 main{max-width:880px;margin:18px auto;padding:0 16px}
 .glabel{font-size:12px;color:#94a3b8;font-weight:700;text-transform:uppercase;letter-spacing:.05em;margin:20px 4px 8px;display:flex;align-items:center;gap:8px}
@@ -1007,7 +1078,7 @@ main{max-width:880px;margin:18px auto;padding:0 16px}
 .paction{margin-top:16px}
 </style></head><body>
 <div id=banner class=banner style=display:none></div>
-<header><h1>PrintReadyArt \\u2014 My Orders</h1><div class=chips id=chips></div></header>
+<header><h1>PrintReadyArt &mdash; My Orders</h1><div class=chips id=chips></div></header>
 <main id=main></main>
 <div id=backdrop onclick="closeDetail()"></div>
 <div id=panel></div>
@@ -1026,18 +1097,23 @@ async function load(){
   if(panelOpenId&&byId[panelOpenId])fillPanel(byId[panelOpenId]);
 }
 function renderChips(){
-  var av=(data.claimable||[]).length,pr=(data.claimed||[]).length,ed=(data.edits||[]).length;
+  var av=(data.claimable||[]).length,ed=(data.edits||[]).length;
+  var slots=(data.openCount!=null?data.openCount:0)+' of '+(data.limit!=null?data.limit:0);
+  var full=!data.underLimit;
+  var mt=(data.monthlyTimer!=null&&data.monthlyTimer!=='')?(data.monthlyTimer+'h'):'\\u2013';
+  var met=(data.monthlyEditTimer!=null&&data.monthlyEditTimer!=='')?(data.monthlyEditTimer+'h'):'\\u2013';
   chips.innerHTML=
-    '<span class="chip info'+(av?'':' zero')+'">'+av+' to claim</span>'+
-    '<span class="chip'+(pr?'':' zero')+'">'+pr+' in progress</span>'+
-    '<span class="chip danger'+(ed?'':' zero')+'">'+ed+' edit'+(ed===1?'':'s')+'</span>'+
+    (ed?'<span class="chip danger">'+ed+' edit'+(ed===1?'':'s')+'</span>':'')+
+    (av?'<span class="chip info">'+av+' to claim</span>':'')+
+    '<span class=chip title="Avg turnaround this month \\u2014 orders (claim\\u2192done) / edits">Month \\u23F1 '+esc(String(mt))+' ord / '+esc(String(met))+' edit</span>'+
+    '<span class="chip slots'+(full?' full':'')+'">'+slots+' slots</span>'+
     '<button class=logout onclick=logout()>Log out</button>';
 }
 function renderList(){
   var av=(data.claimable||[]).slice(),pr=(data.claimed||[]).slice(),ed=(data.edits||[]).slice();
   pr.sort(function(a,b){return new Date(a.claimedAt||0)-new Date(b.claimedAt||0);});
   ed.sort(function(a,b){var m=(b.multiEdit?1:0)-(a.multiEdit?1:0);if(m)return m;return new Date((a.edit&&a.edit.created)||0)-new Date((b.edit&&b.edit.created)||0);});
-  var html=groupHtml('Available to claim',av,'available')+groupHtml('In progress',pr,'progress')+groupHtml('Edit requests',ed,'edit');
+  var html=groupHtml('Edit requests',ed,'edit')+groupHtml('Available to claim',av,'available')+groupHtml('In progress',pr,'progress');
   main.innerHTML=html||'<div class=muted>Nothing in your queue right now.</div>';
 }
 function groupHtml(label,arr,state){
