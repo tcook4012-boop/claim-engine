@@ -33,6 +33,9 @@ const SENDGRID_KEY = process.env.SENDGRID_API_KEY || "";
 const MAIL_FROM_EMAIL = "contact@printreadyart.com";
 const MAIL_FROM_NAME = "Print Ready Art";
 const MAIL_BCC = "contact@printreadyart.com"; // matches the current "bcc: me"; set "" for none
+const MAIL_ADMIN_TO = "contact@printreadyart.com"; // where vendor->admin messages land
+const MAIL_ADMIN_CC = "brian@printreadyart.com";   // CC on vendor->admin messages
+const OM = "order_message"; // Bubble Data API type slug for the message thread
 
 // Required capabilities for an order (mirrors the engine, scoped-subset model):
 // type cap, plus separations only on Vector, ofm/pfx only on Digitizing.
@@ -309,6 +312,90 @@ function mountVendorPortal(app, deps) {
     } catch (e) { console.warn("[email] send failed:", e.message); }
   }
 
+  // Generic SendGrid sender (best-effort) used by the messaging notifications.
+  async function sendMail({ to, cc, subject, text, html }) {
+    try {
+      if (!SENDGRID_KEY) { console.warn("[email] SENDGRID_API_KEY not set -- skipping send"); return; }
+      if (!to) { console.warn("[email] no recipient -- skipping send"); return; }
+      const pers = { to: [{ email: to }] };
+      if (cc) pers.cc = (Array.isArray(cc) ? cc : [cc]).filter(Boolean).map((e) => ({ email: e }));
+      const content = [{ type: "text/plain", value: text }];
+      if (html) content.push({ type: "text/html", value: html });
+      const payload = { personalizations: [pers], from: { email: MAIL_FROM_EMAIL, name: MAIL_FROM_NAME }, subject, content };
+      const res = await fetch("https://api.sendgrid.com/v3/mail/send", {
+        method: "POST", headers: { Authorization: `Bearer ${SENDGRID_KEY}`, "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      if (!(res.status >= 200 && res.status < 300)) console.warn(`[email] SendGrid ${res.status}: ${await res.text()}`);
+    } catch (e) { console.warn("[email] send failed:", e.message); }
+  }
+
+  // Notify the other party that a message arrived (deduped by the caller).
+  async function notifyMessage(role, orderNo, senderEmail) {
+    if (role === "vendor") {
+      await sendMail({ to: MAIL_ADMIN_TO, cc: MAIL_ADMIN_CC,
+        subject: `New message from a vendor on Order #${orderNo}`,
+        text: `${senderEmail} sent a message on Order #${orderNo}.\n\nOpen the Orders dashboard to read and reply.`,
+        html: `${senderEmail} sent a message on Order #${orderNo}.<br><br>Open the Orders dashboard to read and reply.` });
+    } else {
+      let vendorEmail = "";
+      try {
+        const rows = await search("uploaded_image", [{ key: "Order#", constraint_type: "equals", value: orderNo }]);
+        vendorEmail = rows[0] ? String(rows[0][F.assignedArtist] || "") : "";
+      } catch (e) { console.warn("[msg] vendor lookup failed:", e.message); }
+      if (!vendorEmail) return;
+      await sendMail({ to: vendorEmail,
+        subject: `PrintReadyArt messaged you on Order #${orderNo}`,
+        text: `PrintReadyArt sent you a message on Order #${orderNo}.\n\nLog in to your vendor portal to read and reply.`,
+        html: `PrintReadyArt sent you a message on Order #${orderNo}.<br><br>Log in to your vendor portal to read and reply.` });
+    }
+  }
+
+  // ---- Messaging endpoints (vendor <-> admin, per order) -------------------
+  app.get("/vendor/api/messages", requireVendor, async (req, res) => {
+    try {
+      const orderNo = String(req.query.orderNo || "");
+      if (!orderNo) return res.json({ messages: [] });
+      const rows = await search(OM, [{ key: "order_no", constraint_type: "equals", value: orderNo }]);
+      rows.sort((a, b) => new Date(a["Created Date"] || 0) - new Date(b["Created Date"] || 0));
+      res.json({ messages: rows.map((m) => ({ role: m.sender_role, email: m.sender_email, body: m.body, at: m["Created Date"] })) });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.post("/vendor/api/messages", express.json(), requireVendor, async (req, res) => {
+    try {
+      const s = req.session;
+      const orderNo = String(req.body.orderNo || "").trim();
+      const body = String(req.body.body || "").trim();
+      if (!orderNo || !body) return res.status(400).json({ ok: false, error: "orderNo and body required" });
+      const role = s.isAdmin ? "admin" : "vendor";
+      const senderEmail = s.isAdmin ? MAIL_FROM_EMAIL : effectiveEmail(s);
+      // Dedupe the email heads-up: only notify if the recipient has no unread message
+      // from this sender on this order yet (a burst = one email, not ten).
+      const recipientField = role === "admin" ? "read_by_vendor" : "read_by_admin";
+      const existing = await search(OM, [{ key: "order_no", constraint_type: "equals", value: orderNo }]);
+      const alreadyPending = existing.some((m) => m.sender_role === role && m[recipientField] !== true);
+      await bubble("POST", `/${OM}`, {
+        order_no: orderNo, sender_role: role, sender_email: senderEmail, body,
+        read_by_admin: role === "admin", read_by_vendor: role === "vendor",
+      });
+      if (!alreadyPending) notifyMessage(role, orderNo, senderEmail).catch((e) => console.warn("[msg] notify failed:", e.message));
+      res.json({ ok: true });
+    } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+  });
+
+  app.post("/vendor/api/messages/read", express.json(), requireVendor, async (req, res) => {
+    try {
+      const s = req.session;
+      const orderNo = String(req.body.orderNo || "").trim();
+      if (!orderNo) return res.json({ ok: true });
+      const field = s.isAdmin ? "read_by_admin" : "read_by_vendor";
+      const otherRole = s.isAdmin ? "vendor" : "admin";
+      const rows = await search(OM, [{ key: "order_no", constraint_type: "equals", value: orderNo }]);
+      const toMark = rows.filter((m) => m.sender_role === otherRole && m[field] !== true);
+      for (const m of toMark) await bubble("PATCH", `/${OM}/${m._id}`, { [field]: true });
+      res.json({ ok: true, marked: toMark.length });
+    } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+  });
+
   app.get("/vendor/api/orders", requireVendor, async (req, res) => {
     try {
       const email = effectiveEmail(req.session);
@@ -379,6 +466,16 @@ function mountVendorPortal(app, deps) {
         return base;
       }));
       const sp = await monthlySpeeds(email);
+      // Unread indicator (one cheap search piggybacked on this existing refresh):
+      // admin messages this vendor hasn't read yet. Mark matching claimed/edit rows.
+      try {
+        const unread = await search(OM, [
+          { key: "sender_role", constraint_type: "equals", value: "admin" },
+          { key: "read_by_vendor", constraint_type: "equals", value: false }]);
+        const unreadSet = new Set(unread.map((m) => String(m.order_no)));
+        claimedViews.forEach((v) => { if (unreadSet.has(String(v.orderNo))) v.unread = true; });
+        editViews.forEach((v) => { if (unreadSet.has(String(v.orderNo))) v.unread = true; });
+      } catch (e) { console.warn("[orders] unread scan failed:", e.message); }
       res.json({
         email, limit, openCount: load, claimedCount: mine.length, editCount, underLimit,
         actingAs: req.session.actingAs || null,
@@ -738,6 +835,14 @@ function mountVendorPortal(app, deps) {
       }).sort((x, y) => (x.email > y.email ? 1 : -1));
       const vendors = artists.filter((a) => a.is_active_vendor === true)
         .map((a) => String(a.email || "").toLowerCase()).filter(Boolean).sort();
+      // Unread indicator: vendor messages the admin hasn't read (one cheap search).
+      try {
+        const unread = await search(OM, [
+          { key: "sender_role", constraint_type: "equals", value: "vendor" },
+          { key: "read_by_admin", constraint_type: "equals", value: false }]);
+        const unreadSet = new Set(unread.map((m) => String(m.order_no)));
+        orders.forEach((o) => { if (unreadSet.has(String(o.orderNo))) o.unread = true; });
+      } catch (e) { console.warn("[dashboard] unread scan failed:", e.message); }
       res.json({ totals, artists: artistRows, orders, vendors });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
@@ -992,6 +1097,18 @@ table.stats td.g,table.stats td.o,table.stats td.r{font-weight:700}.g{color:#16a
 .specline{font-size:13px;color:#334155;margin:4px 0}.specline b{color:#0f172a}
 .multibanner{display:flex;gap:8px;background:#fee2e2;color:#991b1b;border-radius:8px;padding:9px 12px;font-size:13px;font-weight:700;margin-bottom:12px}
 .eligbox{margin-top:10px;padding:10px 12px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px}
+.msgwrap{margin-top:16px;border-top:1px solid #eef2f6;padding-top:14px}
+.thread{max-height:240px;overflow-y:auto;background:#f8fafc;border:1px solid #eef2f6;border-radius:8px;padding:10px;display:flex;flex-direction:column;gap:8px}
+.msgempty{color:#94a3b8;font-size:13px;text-align:center;padding:14px}
+.bub{max-width:82%;padding:7px 10px;border-radius:12px;font-size:13px}
+.bub.me{align-self:flex-end;background:#2563eb;color:#fff;border-bottom-right-radius:3px}
+.bub.them{align-self:flex-start;background:#fff;border:1px solid #e2e8f0;color:#0f172a;border-bottom-left-radius:3px}
+.bubmeta{font-size:10px;opacity:.7;margin-bottom:2px}
+.bubtext{white-space:pre-wrap;word-break:break-word}
+.msgrow{display:flex;gap:8px;margin-top:8px}
+.msgrow textarea{flex:1;padding:8px;border:1px solid #cbd5e1;border-radius:8px;font-size:13px;font-family:inherit;resize:vertical}
+.msgsend{background:#2563eb;color:#fff;border:0;border-radius:8px;padding:0 16px;font-size:13px;font-weight:600;cursor:pointer}
+.mini.msgnew{background:#2563eb;color:#fff}
 .uploadwrap{margin-top:16px;border-top:1px solid #eef2f6;padding-top:14px}.uploadwrap .tag{font-size:12px;color:#64748b;display:block;margin-bottom:4px}
 .upload{background:#2563eb;color:#fff;border:0;border-radius:8px;padding:8px 14px;font-size:13px;font-weight:600;cursor:pointer}
 .cancelbtn{background:#fee2e2;color:#b91c1c;border:0;border-radius:8px;padding:8px 14px;font-size:13px;font-weight:600;cursor:pointer}
@@ -1091,7 +1208,7 @@ function renderList(){
 function rowHtml(o){
   var thumb=o.thumb?'<img class=rthumb src="'+o.thumb+'" onerror="this.outerHTML=phThumb()">':phThumb();
   var assigned=o.assigned?esc(shortUser(o.assigned)):'<span class="mini m-un">Unassigned</span>';
-  var marks=(o.separations==='yes'?'<span class="mini m-sep">Sep</span>':'')+(o.rush==='yes'?'<span class="mini m-rush">Rush</span>':'')+(o.multiEdit?'<span class="mini m-multi">\\u26A0 Multi-edit</span>':'');
+  var marks=(o.unread?'<span class="mini msgnew">\\uD83D\\uDCAC New</span>':'')+(o.separations==='yes'?'<span class="mini m-sep">Sep</span>':'')+(o.rush==='yes'?'<span class="mini m-rush">Rush</span>':'')+(o.multiEdit?'<span class="mini m-multi">\\u26A0 Multi-edit</span>':'');
   var pill=(o.claimedHours!=null)
     ? '<div class="timer '+ageClass(o.claimedHours)+'" title="Time held since claimed">'+fmtH(o.claimedHours)+'</div>'
     : '<div class="timer '+ageClass(o.createdHours)+'" title="Unclaimed \\u2014 time since placed">\\u231B '+fmtH(o.createdHours)+'</div>';
@@ -1144,16 +1261,32 @@ function fillPanel(o){
       (fullv.length?'<div class=tmpl-label style=margin-top:8px>Eligible but at capacity</div>'+vendList(fullv):'')+
       (!el.length?'<div style=font-size:13px;color:#b91c1c;margin-top:4px>No eligible vendor has these capabilities \\u2014 assign manually or add a capable vendor.</div>':'')+'</div>';
   }
+  var msgBlock=claimed
+    ? '<div class=msgwrap><div class=tmpl-label>Messages with '+esc(o.assigned||'vendor')+'</div><div id=thread class=thread>Loading\\u2026</div><div class=msgrow><textarea id=msgInput rows=2 placeholder="Write a message\\u2026"></textarea><button class=msgsend onclick="sendMsg(\\''+esc(o.orderNo)+'\\')">Send</button></div></div>'
+    : '<div class=msgwrap><div class=tmpl-label>Messages</div><div class=msgempty style=text-align:left>Messaging opens once a vendor claims this order.</div></div>';
   panel.innerHTML='<div class=phead><div><div class=ptitle>Order '+esc(o.orderNo||o.id)+'</div><div class=peyebrow>'+esc(o.type||'')+(o.ref?' \\u00b7 PO '+esc(o.ref):'')+'</div></div><button class=pclose onclick="closeDetail()">\\u2715</button></div>'+
     '<div class=pbody>'+multi+'<div>'+badges+'</div>'+thumb+
     '<div class=specline><b>Client:</b> '+esc(o.user||'?')+'</div>'+statusBlock+
     '<div class=specline><b>Created:</b> '+(o.createdHours!=null?fmtH(o.createdHours)+' ago':'\\u2013')+'</div>'+
     '<div class=uploadwrap><span class=tag>Assign / reassign to vendor</span><div style=display:flex;gap:8px;flex-wrap:wrap><select id=asgSel>'+(o.assigned?'':'<option value="">choose\\u2026</option>')+opts+'</select>'+
     '<button class=upload onclick="assignOrder(\\''+o.id+'\\')">'+(o.assigned?'Reassign':'Push')+'</button></div>'+
-    '<div style=margin-top:14px><button class=cancelbtn onclick="cancelOrder(\\''+o.id+'\\')">Cancel order</button></div><span id=pmsg class=tag style=display:block;margin-top:8px></span></div></div>';
+    '<div style=margin-top:14px><button class=cancelbtn onclick="cancelOrder(\\''+o.id+'\\')">Cancel order</button></div><span id=pmsg class=tag style=display:block;margin-top:8px></span></div>'+
+    msgBlock+'</div>';
 }
-function openDetail(id){var o=byId[id];if(!o)return;panelOpenId=id;fillPanel(o);panel.classList.add('open');backdrop.classList.add('open');}
-function closeDetail(){panelOpenId=null;panel.classList.remove('open');backdrop.classList.remove('open');load();}
+var msgPoll=null,msgOrderNo=null;
+function openThread(orderNo){msgOrderNo=orderNo;loadThread();markThreadRead();if(msgPoll)clearInterval(msgPoll);msgPoll=setInterval(function(){if(msgOrderNo)loadThread();},9000);}
+function stopThread(){if(msgPoll)clearInterval(msgPoll);msgPoll=null;msgOrderNo=null;}
+function loadThread(){if(!msgOrderNo)return;fetch('/vendor/api/messages?orderNo='+encodeURIComponent(msgOrderNo)).then(function(r){return r.json();}).then(function(d){renderThread(d.messages||[]);}).catch(function(){});}
+function renderThread(msgs){var el=document.getElementById('thread');if(!el)return;
+  if(!msgs.length){el.innerHTML='<div class=msgempty>No messages yet.</div>';return;}
+  el.innerHTML=msgs.map(function(m){var mine=m.role==='admin';return '<div class="bub '+(mine?'me':'them')+'"><div class=bubmeta>'+(mine?'You':esc(m.email||'Vendor'))+' \\u00b7 '+msgTime(m.at)+'</div><div class=bubtext>'+esc(m.body)+'</div></div>';}).join('');
+  el.scrollTop=el.scrollHeight;}
+function sendMsg(orderNo){var ta=document.getElementById('msgInput');if(!ta)return;var body=ta.value.trim();if(!body)return;ta.value='';
+  fetch('/vendor/api/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({orderNo:orderNo,body:body})}).then(function(r){return r.json();}).then(function(){loadThread();}).catch(function(){});}
+function markThreadRead(){if(!msgOrderNo)return;fetch('/vendor/api/messages/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({orderNo:msgOrderNo})}).catch(function(){});}
+function msgTime(at){if(!at)return'';var d=new Date(at);if(isNaN(d))return'';return d.toLocaleString([],{month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit'});}
+function openDetail(id){var o=byId[id];if(!o)return;panelOpenId=id;fillPanel(o);panel.classList.add('open');backdrop.classList.add('open');if(o.state==='claimed')openThread(o.orderNo);}
+function closeDetail(){stopThread();panelOpenId=null;panel.classList.remove('open');backdrop.classList.remove('open');load();}
 function assignOrder(id){
   var email=document.getElementById('asgSel').value;var msg=document.getElementById('pmsg');
   if(!email){msg.textContent='Pick a vendor';msg.style.color='#dc2626';return;}
@@ -1229,6 +1362,18 @@ main{max-width:880px;margin:18px auto;padding:0 16px}
 .multibanner{display:flex;align-items:center;gap:8px;background:#fee2e2;color:#991b1b;border-radius:8px;padding:9px 12px;font-size:13px;font-weight:700;margin-bottom:12px}
 .uploadwrap{margin-top:16px;border-top:1px solid #eef2f6;padding-top:14px}
 .uploadwrap .tag{font-size:12px;color:#64748b;display:block;margin-top:10px;margin-bottom:3px}
+.msgwrap{margin-top:16px;border-top:1px solid #eef2f6;padding-top:14px}
+.thread{max-height:240px;overflow-y:auto;background:#f8fafc;border:1px solid #eef2f6;border-radius:8px;padding:10px;display:flex;flex-direction:column;gap:8px}
+.msgempty{color:#94a3b8;font-size:13px;text-align:center;padding:14px}
+.bub{max-width:82%;padding:7px 10px;border-radius:12px;font-size:13px}
+.bub.me{align-self:flex-end;background:#2563eb;color:#fff;border-bottom-right-radius:3px}
+.bub.them{align-self:flex-start;background:#fff;border:1px solid #e2e8f0;color:#0f172a;border-bottom-left-radius:3px}
+.bubmeta{font-size:10px;opacity:.7;margin-bottom:2px}
+.bubtext{white-space:pre-wrap;word-break:break-word}
+.msgrow{display:flex;gap:8px;margin-top:8px}
+.msgrow textarea{flex:1;padding:8px;border:1px solid #cbd5e1;border-radius:8px;font-size:13px;font-family:inherit;resize:vertical}
+.msgsend{background:#2563eb;color:#fff;border:0;border-radius:8px;padding:0 16px;font-size:13px;font-weight:600;cursor:pointer}
+.mini.msgnew{background:#2563eb;color:#fff}
 .uploadwrap input{padding:7px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px}
 .upload{background:#2563eb;color:#fff;border:0;border-radius:8px;padding:9px 16px;font-size:14px;font-weight:600;cursor:pointer;margin-top:12px}
 .paction{margin-top:16px}
@@ -1293,6 +1438,7 @@ function rowHtml(o,state){
   var cls='row'+(state==='edit'?' ed':'');
   var thumb=o.thumb?'<img class=rthumb src="'+o.thumb+'" onerror="this.outerHTML=phThumb()">':phThumb();
   var marks='';
+  if(o.unread)marks+='<span class="mini msgnew">\\uD83D\\uDCAC New</span>';
   if(o.separations==='yes')marks+='<span class="mini m-sep">Sep</span>';
   if(o.multiEdit)marks+='<span class="mini m-multi">\\u26A0 Multi-edit</span>';
   var sub=(state==='edit')?esc((o.edit&&o.edit.changes)||'Edit requested'):('Order '+esc(o.orderNo)+(o.user?' \\u00b7 '+esc(shortUser(o.user)):''));
@@ -1356,10 +1502,27 @@ function fillPanel(o){
   var notes=o.specialInstructions?'<div class=notes><b>Special instructions:</b> '+esc(o.specialInstructions)+'</div>':'';
   var action=(state==='available')?'<div class=paction><button class=upload style=background:#16a34a onclick="claim(\\''+o.id+'\\')">Claim this order</button></div>':uploadFormHtml(o,state==='edit');
   panel.innerHTML='<div class=phead><div><div class=ptitle>'+esc(o.ref||('Order '+o.orderNo))+'</div><div class=peyebrow>Order '+esc(o.orderNo||'')+(o.type?' \\u00b7 '+esc(o.type):'')+'</div></div><div style=display:flex;gap:8px;align-items:center>'+pill+'<button class=pclose onclick="closeDetail()">\\u2715</button></div></div>'+
-    '<div class=pbody>'+multi+'<div>'+badges+'</div>'+thumb+(state==='edit'?editBlockHtml(o):'')+notes+specBlockHtml(o)+tmplBlockHtml(o)+filesBlockHtml(o,state)+action+'</div>';
+    '<div class=pbody>'+multi+'<div>'+badges+'</div>'+thumb+(state==='edit'?editBlockHtml(o):'')+notes+specBlockHtml(o)+tmplBlockHtml(o)+filesBlockHtml(o,state)+action+(state!=='available'?msgBlockHtml(o):'')+'</div>';
 }
-function openDetail(key){var o=byId[key];if(!o)return;panelOpenId=key;fillPanel(o);panel.classList.add('open');backdrop.classList.add('open');}
-function closeDetail(){panelOpenId=null;panel.classList.remove('open');backdrop.classList.remove('open');load();}
+function msgBlockHtml(o){
+  return '<div class=msgwrap><div class=tmpl-label>Messages with PrintReadyArt</div>'+
+    '<div id=thread class=thread>Loading\\u2026</div>'+
+    '<div class=msgrow><textarea id=msgInput rows=2 placeholder="Write a message\\u2026"></textarea><button class=msgsend onclick="sendMsg(\\''+esc(o.orderNo)+'\\')">Send</button></div></div>';
+}
+var msgPoll=null,msgOrderNo=null;
+function openThread(orderNo){msgOrderNo=orderNo;loadThread();markThreadRead();if(msgPoll)clearInterval(msgPoll);msgPoll=setInterval(function(){if(msgOrderNo)loadThread();},9000);}
+function stopThread(){if(msgPoll)clearInterval(msgPoll);msgPoll=null;msgOrderNo=null;}
+function loadThread(){if(!msgOrderNo)return;fetch('/vendor/api/messages?orderNo='+encodeURIComponent(msgOrderNo)).then(function(r){return r.json();}).then(function(d){renderThread(d.messages||[]);}).catch(function(){});}
+function renderThread(msgs){var el=document.getElementById('thread');if(!el)return;
+  if(!msgs.length){el.innerHTML='<div class=msgempty>No messages yet.</div>';return;}
+  el.innerHTML=msgs.map(function(m){var mine=m.role==='vendor';return '<div class="bub '+(mine?'me':'them')+'"><div class=bubmeta>'+(mine?'You':'PrintReadyArt')+' \\u00b7 '+msgTime(m.at)+'</div><div class=bubtext>'+esc(m.body)+'</div></div>';}).join('');
+  el.scrollTop=el.scrollHeight;}
+function sendMsg(orderNo){var ta=document.getElementById('msgInput');if(!ta)return;var body=ta.value.trim();if(!body)return;ta.value='';
+  fetch('/vendor/api/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({orderNo:orderNo,body:body})}).then(function(r){return r.json();}).then(function(){loadThread();}).catch(function(){});}
+function markThreadRead(){if(!msgOrderNo)return;fetch('/vendor/api/messages/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({orderNo:msgOrderNo})}).catch(function(){});}
+function msgTime(at){if(!at)return'';var d=new Date(at);if(isNaN(d))return'';return d.toLocaleString([],{month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit'});}
+function openDetail(key){var o=byId[key];if(!o)return;panelOpenId=key;fillPanel(o);panel.classList.add('open');backdrop.classList.add('open');if(o._state!=='available')openThread(o.orderNo);}
+function closeDetail(){stopThread();panelOpenId=null;panel.classList.remove('open');backdrop.classList.remove('open');load();}
 function esc(s){return String(s==null?'':s).replace(/[<>&]/g,function(c){return c==='<'?'&lt;':c==='>'?'&gt;':'&amp;';});}
 function elapsedText(lbl,since){var el=fmtElapsed(since);return '\\u23F1 '+lbl+' '+el+(el==='just now'?'':' ago');}
 function fmtElapsed(since){
