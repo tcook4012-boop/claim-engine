@@ -202,10 +202,8 @@ function mountVendorPortal(app, deps) {
     const thumb = o.image ? (String(o.image).startsWith("//") ? "https:" + o.image : String(o.image)) : "";
     const v = {
       id: o._id,
-      ref: o[REF_FIELD] || "",
       orderNo: o["Order#"] || "",
       type: o.Order_Type || "",
-      user: o.User || "",
       state: o[F.claimState] || "",
       claimDeadline: o[F.claimDeadline] || null,
       claimedAt: o.claimed_at || null,
@@ -1503,11 +1501,11 @@ function rowHtml(o,state){
   if(o.unread)marks+='<span class="mini msgnew">\\uD83D\\uDCAC New</span>';
   if(o.separations==='yes')marks+='<span class="mini m-sep">Sep</span>';
   if(o.multiEdit)marks+='<span class="mini m-multi">\\u26A0 Multi-edit</span>';
-  var sub=(state==='edit')?esc((o.edit&&o.edit.changes)||'Edit requested'):('Order '+esc(o.orderNo)+(o.user?' \\u00b7 '+esc(shortUser(o.user)):''));
+  var sub=(state==='edit')?esc((o.edit&&o.edit.changes)||'Edit requested'):('Order '+esc(o.orderNo));
   var since=(state==='edit'&&o.edit)?o.edit.created:o.claimedAt;var lbl=state==='edit'?'edit requested':'claimed';
   var right=since?'<div class="timer '+timerClass(since)+'" data-since="'+since+'" data-label="'+lbl+'">'+elapsedText(lbl,since)+'</div>':'';
   return '<div class="'+cls+'" onclick="openDetail(\\''+o._key+'\\')">'+thumb+
-    '<div class=rmain><div class=rtitle>'+esc(o.ref||('Order '+o.orderNo))+marks+'</div><div class=rsub>'+sub+'</div></div>'+
+    '<div class=rmain><div class=rtitle>Order '+esc(o.orderNo||o.id)+marks+'</div><div class=rsub>'+sub+'</div></div>'+
     '<div class=rtype>'+esc(o.type||'')+'</div><div class=rright>'+right+'<i class=chev>\\u203A</i></div></div>';
 }
 function specBlockHtml(o){
@@ -1563,7 +1561,7 @@ function fillPanel(o){
   var thumb=o.thumb?'<img class=pthumb src="'+o.thumb+'" onclick="window.open(\\''+o.thumb+'\\',\\'_blank\\')" onerror="this.style.display=\\'none\\'">':'';
   var notes=o.specialInstructions?'<div class=notes><b>Special instructions:</b> '+esc(o.specialInstructions)+'</div>':'';
   var action=(state==='available')?'<div class=paction><button class=upload style=background:#16a34a onclick="claim(\\''+o.id+'\\')">Claim this order</button></div>':uploadFormHtml(o,state==='edit');
-  panel.innerHTML='<div class=phead><div><div class=ptitle>'+esc(o.ref||('Order '+o.orderNo))+'</div><div class=peyebrow>Order '+esc(o.orderNo||'')+(o.type?' \\u00b7 '+esc(o.type):'')+'</div></div><div style=display:flex;gap:8px;align-items:center>'+pill+'<button class=pclose onclick="closeDetail()">\\u2715</button></div></div>'+
+  panel.innerHTML='<div class=phead><div><div class=ptitle>Order '+esc(o.orderNo||'')+'</div><div class=peyebrow>'+esc(o.type||'')+'</div></div><div style=display:flex;gap:8px;align-items:center>'+pill+'<button class=pclose onclick="closeDetail()">\\u2715</button></div></div>'+
     '<div class=pbody>'+multi+'<div>'+badges+'</div>'+thumb+(state==='edit'?editBlockHtml(o):'')+notes+specBlockHtml(o)+tmplBlockHtml(o)+filesBlockHtml(o,state)+action+(state!=='available'?msgBlockHtml(o):'')+'</div>';
 }
 function msgBlockHtml(o){
