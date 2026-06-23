@@ -786,6 +786,8 @@ th,td{padding:10px 12px;text-align:center;border-bottom:1px solid #eef2f6;font-s
 th{background:#f1f5f9;color:#334155;font-weight:700;font-size:13px;white-space:nowrap}
 th.vh,td.vh{text-align:left;min-width:180px}
 .vemail{font-weight:600}.vsub{color:#94a3b8;font-size:12px}
+tr.warnrow{background:#fef2f2}tr.warnrow td{border-top:1px solid #fecaca}
+.warnmsg{color:#b91c1c;font-size:11px;font-weight:600;margin-top:3px}.nomail{color:#b91c1c}
 td input[type=checkbox]{width:18px;height:18px;cursor:pointer}
 input[type=number]{width:58px;padding:5px;border:1px solid #cbd5e1;border-radius:6px}
 button{border:0;border-radius:8px;padding:7px 12px;font-weight:600;cursor:pointer}
@@ -821,7 +823,16 @@ function render(){
   let rows='';
   vendors.forEach(function(v,i){
     const caps=new Set((v.capabilities||[]).map(function(c){return String(c).toLowerCase();}));
-    rows+='<tr data-i="'+i+'"><td class=vh><div class=vemail>'+(v.email||'(no email)')+'</div><div class=vsub>'+(v.contact||'')+'</div></td>';
+    // An active vendor can't actually receive work if they have no email (system finds
+    // vendors only by email), no capabilities, or a zero/blank max. Flag it loudly.
+    var maxv=v.maxConcurrent;var maxOk=(maxv!==''&&maxv!=null&&Number(maxv)>0);
+    var problems=[];
+    if(v.active&&!(v.email&&String(v.email).trim()))problems.push('no email \\u2014 cannot be found');
+    if(v.active&&caps.size===0)problems.push('no capabilities');
+    if(v.active&&!maxOk)problems.push('max is 0/blank');
+    var warn=problems.length?' warnrow':'';
+    rows+='<tr data-i="'+i+'" class="'+warn.trim()+'"><td class=vh><div class=vemail>'+(v.email||'<span class=nomail>(no email)</span>')+'</div><div class=vsub>'+(v.contact||'')+'</div>'+
+      (problems.length?'<div class=warnmsg>\\u26A0 Active but can\\'t claim: '+problems.join('; ')+'</div>':'')+'</td>';
     columns.forEach(function(c){rows+='<td><input type=checkbox data-cap="'+c.tag+'" '+(caps.has(c.tag)?'checked':'')+'></td>';});
     rows+='<td><label class=switch><input type=checkbox class=active '+(v.active?'checked':'')+'><span class=slider></span></label></td>';
     rows+='<td><input type=number class=max min=0 value="'+((v.maxConcurrent===0||v.maxConcurrent)?v.maxConcurrent:'')+'"></td></tr>';
