@@ -25,6 +25,24 @@ const sessions = new Map(); // token -> { email, isAdmin, actingAs, created }
 const SESSION_HOURS = 12;
 
 function makeToken() { return crypto.randomBytes(32).toString("hex"); }
+
+// Required capabilities for an order (mirrors the engine, scoped-subset model):
+// type cap, plus separations only on Vector, ofm/pfx only on Digitizing.
+const TYPE_CAP = { "Vector": "vector", "Digitizing": "digitizing", "Digital (DTF/DTG)": "digital_printing" };
+function requiredCapsFor(o) {
+  const caps = []; const t = TYPE_CAP[o.Order_Type]; if (t) caps.push(t);
+  if (o.Order_Type === "Vector" && o.Separations === "yes") caps.push("separations");
+  if (o.Order_Type === "Digitizing") {
+    if (o.OFM === "yes") caps.push("ofm");
+    if (o.PXF === "yes") caps.push("pfx");
+  }
+  return caps;
+}
+function vendorCanDo(order, caps) {
+  const need = requiredCapsFor(order);
+  const have = (caps || []).map((c) => String(c).toLowerCase());
+  return need.every((c) => have.includes(c));
+}
 function newSession(data) {
   const token = makeToken();
   sessions.set(token, { ...data, created: Date.now() });
@@ -250,9 +268,13 @@ function mountVendorPortal(app, deps) {
       const email = effectiveEmail(req.session);
       const a = await artistByEmail(email);
       const limit = a ? a.maxConcurrent : 0;
-      const claimable = await search("uploaded_image", [
-        { key: F.assignedArtist, constraint_type: "equals", value: email },
+      const myCaps = a ? a.capabilities : [];
+      // SHARED POOL: every unclaimed order is visible to any vendor whose capabilities
+      // match it -- not just orders pre-stamped to this vendor. We pull the whole
+      // unclaimed pool and filter to the ones this vendor is eligible for.
+      const pool = await search("uploaded_image", [
         { key: F.claimState, constraint_type: "equals", value: CS.unclaimed }]);
+      const claimable = pool.filter((o) => vendorCanDo(o, myCaps));
       const mine = await search("uploaded_image", [
         { key: F.assignedArtist, constraint_type: "equals", value: email },
         { key: F.claimState, constraint_type: "equals", value: CS.claimed }]);
@@ -558,15 +580,8 @@ function mountVendorPortal(app, deps) {
       const editsByVendor = {};
       openEdits.forEach((e) => { const a = String(e.Assigned_Artist || "").toLowerCase(); if (a) editsByVendor[a] = (editsByVendor[a] || 0) + 1; });
       // An order is only ACTUALLY claimed when claim_state === "claimed". The engine
-      // pre-stamps Assigned_Artist while offering, so we never treat that as claimed.
-      const TYPE_CAP = { "Vector": "vector", "Digitizing": "digitizing", "Digital (DTF/DTG)": "digital_printing" };
-      const reqCapsFor = (o) => {
-        const c = []; const t = TYPE_CAP[o.Order_Type]; if (t) c.push(t);
-        if (o.Separations === "yes") c.push("separations");
-        if (o.OFM === "yes") c.push("ofm");
-        if (o.PXF === "yes") c.push("pfx");
-        return c;
-      };
+      // pre-stamps nothing now (shared pool), but legacy rows may still carry a stamp;
+      // claim_state is the only source of truth for "claimed".
       const isClaimed = (o) => (o[F.claimState] || "") === "claimed";
       const orders = pending.map((o) => {
         const created = o["Created Date"] ? (now - new Date(o["Created Date"]).getTime()) / 3600000 : null;
@@ -575,8 +590,7 @@ function mountVendorPortal(app, deps) {
           id: o._id, orderNo: o["Order#"] || "", ref: o["Customer_PO#"] || "", type: o.Order_Type || "",
           user: o.User || "", state: o[F.claimState] || "",
           assigned: isClaimed(o) ? String(o[F.assignedArtist] || "") : "",
-          offeredTo: !isClaimed(o) ? String(o[F.assignedArtist] || "") : "",
-          reqCaps: reqCapsFor(o),
+          reqCaps: requiredCapsFor(o),
           thumb: o.image ? (String(o.image).startsWith("//") ? "https:" + o.image : String(o.image)) : "",
           createdHours: created != null ? +created.toFixed(2) : null,
           claimedHours: claimed != null ? +claimed.toFixed(2) : null,
@@ -802,7 +816,19 @@ function render(){
     rows+='<td><input type=number class=max min=0 value="'+((v.maxConcurrent===0||v.maxConcurrent)?v.maxConcurrent:'')+'"></td></tr>';
   });
   grid.innerHTML='<table>'+head+rows+'</table><div style=margin-top:14px><input id=newcap class=tagadd placeholder="add capability column"> <button class=addbtn onclick="addCol()">Add column</button> <span id=status class=saved></span></div>';
-  grid.querySelector('table').addEventListener('change',function(e){const tr=e.target.closest('tr[data-i]');if(tr)saveRow(tr);});
+  grid.querySelector('table').addEventListener('change',function(e){const tr=e.target.closest('tr[data-i]');if(!tr)return;if(e.target.matches&&e.target.matches('input[type=checkbox][data-cap]'))enforceHierarchy(tr,e.target);saveRow(tr);});
+}
+function capBox(tr,tag){return tr.querySelector('input[type=checkbox][data-cap="'+tag+'"]');}
+function enforceHierarchy(tr,el){
+  var tag=el.getAttribute('data-cap');
+  function set(t,val){var c=capBox(tr,t);if(c)c.checked=val;}
+  if(el.checked){
+    if(tag==='separations')set('vector',true);
+    if(tag==='ofm'||tag==='pfx')set('digitizing',true);
+  }else{
+    if(tag==='vector')set('separations',false);
+    if(tag==='digitizing'){set('ofm',false);set('pfx',false);}
+  }
 }
 function addCol(){
   const inp=document.getElementById('newcap');const raw=inp.value.trim();const t=raw.toLowerCase().replace(/\s+/g,'_');
@@ -1033,10 +1059,10 @@ function fillPanel(o){
       '<div class=specline><b>Claimed:</b> '+(o.claimedHours!=null?fmtH(o.claimedHours)+' ago':'\\u2013')+'</div>';
   }else{
     var el=eligibleFor(o);var avail=el.filter(function(v){return v.under;}),fullv=el.filter(function(v){return !v.under;});
-    statusBlock='<div class=specline><b>Status:</b> <span style=color:#b45309;font-weight:700>Unclaimed</span> \\u00b7 waiting '+fmtH(o.createdHours)+' since placed</div>'+
-      (o.offeredTo?'<div class=specline><b>Waiting on (offered to):</b> '+esc(o.offeredTo)+'</div>':'<div class=specline><b>Offered to:</b> not yet offered</div>')+
+    statusBlock='<div class=specline><b>Status:</b> <span style=color:#b45309;font-weight:700>Unclaimed</span> \\u00b7 in the shared pool, waiting '+fmtH(o.createdHours)+' since placed</div>'+
       '<div class=eligbox><div class=tmpl-label>Available to claim now'+(o.reqCaps&&o.reqCaps.length?' \\u00b7 needs: '+esc(o.reqCaps.join(', ')):'')+'</div>'+vendList(avail)+
-      (fullv.length?'<div class=tmpl-label style=margin-top:8px>Eligible but at capacity</div>'+vendList(fullv):'')+'</div>';
+      (fullv.length?'<div class=tmpl-label style=margin-top:8px>Eligible but at capacity</div>'+vendList(fullv):'')+
+      (!el.length?'<div style=font-size:13px;color:#b91c1c;margin-top:4px>No eligible vendor has these capabilities \\u2014 assign manually or add a capable vendor.</div>':'')+'</div>';
   }
   panel.innerHTML='<div class=phead><div><div class=ptitle>Order '+esc(o.orderNo||o.id)+'</div><div class=peyebrow>'+esc(o.type||'')+(o.ref?' \\u00b7 PO '+esc(o.ref):'')+'</div></div><button class=pclose onclick="closeDetail()">\\u2715</button></div>'+
     '<div class=pbody>'+multi+'<div>'+badges+'</div>'+thumb+
@@ -1332,7 +1358,7 @@ input{padding:8px;border:1px solid #cbd5e1;border-radius:6px}.tag{font-size:12px
 </div>
 <div id=list></div></main><script>
 const NVCAPS=['vector','separations','digitizing','ofm','pfx','digital_printing'];
-const NVLABEL={digital_printing:'Digital (DTF/DTG)'};
+const NVLABEL={digital_printing:'Digital (DTF/DTG)',separations:'\\u21b3 Separations (vector)',ofm:'\\u21b3 OFM (embroidery)',pfx:'\\u21b3 PXF (embroidery)'};
 function toggleAdd(){
   const f=document.getElementById('addForm');
   const open=f.style.display==='none';
@@ -1342,6 +1368,13 @@ function toggleAdd(){
     document.getElementById('nvCaps').innerHTML=NVCAPS.map(function(t){
       return '<label class=tag><input type=checkbox data-cap="'+t+'"> '+(NVLABEL[t]||t)+'</label>';
     }).join('');
+    document.getElementById('nvCaps').addEventListener('change',function(e){
+      if(!e.target.matches||!e.target.matches('input[type=checkbox][data-cap]'))return;
+      var box=function(t){return document.querySelector('#nvCaps input[data-cap="'+t+'"]');};
+      var tag=e.target.getAttribute('data-cap');
+      if(e.target.checked){if(tag==='separations')box('vector').checked=true;if(tag==='ofm'||tag==='pfx')box('digitizing').checked=true;}
+      else{if(tag==='vector')box('separations').checked=false;if(tag==='digitizing'){box('ofm').checked=false;box('pfx').checked=false;}}
+    });
   }
 }
 async function createVendor(){
