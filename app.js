@@ -194,6 +194,21 @@ async function tryClaim(orderId, email) {
     return { ok: false, reason: "not_eligible_for_this_work" };
   if ((await countClaimed(email)) >= a.maxConcurrent)
     return { ok: false, reason: "at_limit_finish_open_work_first" };
+  // OLDEST-FIRST PER TYPE: block claiming if an older unclaimed order of the SAME type
+  // that this vendor is ALSO eligible for is still waiting. Prevents cherry-picking
+  // newer/easier orders ahead of the queue (enforced server-side, not just in the UI).
+  if (o.Order_Type) {
+    const sameType = await search("uploaded_image", [
+      { key: F.claimState, constraint_type: "equals", value: CS.unclaimed },
+      { key: "Order_Type", constraint_type: "equals", value: o.Order_Type }]);
+    const myCaps = (a.capabilities || []).map((x) => String(x).toLowerCase());
+    const createdOf = (x) => new Date(x["Created Date"] || 0).getTime();
+    const thisCreated = createdOf(o);
+    const blocker = sameType.find((x) => x._id !== orderId
+      && createdOf(x) < thisCreated
+      && requiredCapsForOrder(x).every((c) => myCaps.includes(c)));
+    if (blocker) return { ok: false, reason: "claim_oldest_first" };
+  }
   await patchOrder(orderId, { [F.claimState]: CS.claimed, [F.assignedArtist]: email, [F.claimedAt]: Date.now() });
   console.log(`[claimed] order ${orderId} by ${email} (from shared pool)`);
   await logEvent(orderId, email, "claimed", "from shared pool");
