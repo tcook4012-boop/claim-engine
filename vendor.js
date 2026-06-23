@@ -276,6 +276,37 @@ function mountVendorPortal(app, deps) {
 
   // Send the "your order is ready" email to the client. Best-effort: any failure is
   // logged and swallowed so a mail hiccup never blocks order completion.
+  // Resolve client email (User id -> user record -> nested auth email) and team name
+  // (Team_Name id -> team record). Cached 10 min so the 30s dashboard refresh doesn't
+  // re-fetch the same clients/teams repeatedly.
+  const _userEmailCache = new Map();
+  const _teamNameCache = new Map();
+  const NAME_TTL = 10 * 60 * 1000;
+  async function clientEmailById(id) {
+    if (!id) return "";
+    const hit = _userEmailCache.get(id);
+    if (hit && Date.now() - hit.at < NAME_TTL) return hit.email;
+    let email = "";
+    try {
+      const u = await bubble("GET", `/user/${id}`).then((r) => r.response);
+      email = u && u.authentication && u.authentication.email && u.authentication.email.email ? u.authentication.email.email : "";
+    } catch (e) { console.warn("[dashboard] client email lookup failed:", e.message); }
+    _userEmailCache.set(id, { at: Date.now(), email });
+    return email;
+  }
+  async function teamNameById(id) {
+    if (!id) return "";
+    const hit = _teamNameCache.get(id);
+    if (hit && Date.now() - hit.at < NAME_TTL) return hit.name;
+    let name = "";
+    try {
+      const t = await bubble("GET", `/team/${id}`).then((r) => r.response);
+      name = t && t.Team_Name ? t.Team_Name : "";
+    } catch (e) { console.warn("[dashboard] team name lookup failed:", e.message); }
+    _teamNameCache.set(id, { at: Date.now(), name });
+    return name;
+  }
+
   async function sendCompletionEmail(o) {
     try {
       if (!SENDGRID_KEY) { console.warn("[email] SENDGRID_API_KEY not set -- skipping send"); return; }
@@ -754,7 +785,7 @@ function mountVendorPortal(app, deps) {
         const claimed = (isClaimed(o) && o.claimed_at) ? (now - new Date(o.claimed_at).getTime()) / 3600000 : null;
         return {
           id: o._id, orderNo: o["Order#"] || "", ref: o["Customer_PO#"] || "", type: o.Order_Type || "",
-          user: o.User || "", state: o[F.claimState] || "",
+          user: o.User || "", teamId: o.Team_Name || "", state: o[F.claimState] || "",
           assigned: isClaimed(o) ? String(o[F.assignedArtist] || "") : "",
           reqCaps: requiredCapsFor(o),
           thumb: o.image ? (String(o.image).startsWith("//") ? "https:" + o.image : String(o.image)) : "",
@@ -835,15 +866,28 @@ function mountVendorPortal(app, deps) {
       }).sort((x, y) => (x.email > y.email ? 1 : -1));
       const vendors = artists.filter((a) => a.is_active_vendor === true)
         .map((a) => String(a.email || "").toLowerCase()).filter(Boolean).sort();
-      // Unread indicator: vendor messages the admin hasn't read (one cheap search).
+      // Resolve client email + team name for each order (cached, deduped across orders).
+      await Promise.all(orders.map(async (ord) => {
+        ord.clientEmail = await clientEmailById(ord.user);
+        ord.teamName = await teamNameById(ord.teamId);
+      }));
+      // Unread indicator + summary box: vendor messages the admin hasn't read.
+      let unreadMessages = [];
       try {
         const unread = await search(OM, [
           { key: "sender_role", constraint_type: "equals", value: "vendor" },
           { key: "read_by_admin", constraint_type: "equals", value: false }]);
         const unreadSet = new Set(unread.map((m) => String(m.order_no)));
         orders.forEach((o) => { if (unreadSet.has(String(o.orderNo))) o.unread = true; });
+        const byNo = {}; orders.forEach((o) => { byNo[String(o.orderNo)] = o; });
+        const seen = new Set();
+        unread.forEach((m) => {
+          const no = String(m.order_no); if (seen.has(no)) return; seen.add(no);
+          const ord = byNo[no];
+          unreadMessages.push({ orderNo: no, id: ord ? ord.id : null, vendor: ord ? (ord.assigned || ord.clientEmail || "") : "" });
+        });
       } catch (e) { console.warn("[dashboard] unread scan failed:", e.message); }
-      res.json({ totals, artists: artistRows, orders, vendors });
+      res.json({ totals, artists: artistRows, orders, vendors, unreadMessages });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
@@ -1053,6 +1097,11 @@ header a{color:#93c5fd;text-decoration:none;margin-left:14px;font-size:14px}
 .tab.active{background:#fff;color:#0f172a;box-shadow:0 -2px 0 #2563eb inset}
 .toppanels{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:14px}
 .totalpanel{background:#fff;border-radius:12px;padding:16px 20px;box-shadow:0 1px 3px rgba(0,0,0,.08);min-width:300px}
+#msgbox:not(:empty){background:#eff6ff;border:1px solid #bfdbfe;border-radius:12px;padding:12px 16px;margin-bottom:14px}
+.msgboxhead{font-size:14px;font-weight:800;color:#1e40af;margin-bottom:8px}
+.msgboxrow{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;color:#1e3a8a}
+.msgboxrow:hover{background:#dbeafe}.msgboxrow.off{cursor:default;color:#64748b;font-weight:500}
+.msgboxgo{margin-left:auto;font-size:12px;color:#2563eb;font-weight:700}.msgboxrow.off .msgboxgo{color:#94a3b8}
 .totalpanel h3{color:#2563eb;margin:0 0 8px;font-size:18px}
 .totalpanel .r{font-size:15px;font-weight:700;margin:5px 0}.totalpanel .r span{font-weight:800}
 .tp-red{color:#dc2626}.tp-orange{color:#d97706}.tp-click{cursor:pointer}.tp-click:hover{text-decoration:underline}
@@ -1119,6 +1168,7 @@ table.stats td.g,table.stats td.o,table.stats td.r{font-weight:700}.g{color:#16a
 <div class=tabs><button class="tab active" id=tabOrders onclick="showTab('orders')">Orders</button><button class=tab id=tabVendors onclick="showTab('vendors')">By Vendor</button></div>
 <div id=paneOrders>
   <div class=toppanels><div id=totalPanel class=totalpanel></div><div id=tiles class=tiles></div></div>
+  <div id=msgbox></div>
   <div class=toolbar>
     <label>Sort <select id=sortSel onchange="setSort(this.value)">
       <option value=placed>Time since placed</option><option value=held>Time held (claimed)</option><option value=vendor>Vendor</option><option value=type>Type</option><option value=multi>Multiple edits first</option></select></label>
@@ -1154,8 +1204,19 @@ async function load(){
   try{const r=await fetch('/vendor/api/admin/dashboard');DATA=await r.json();}
   catch(e){document.getElementById('orders').innerHTML='<div class=muted>Failed to load.</div>';return;}
   byId={};(DATA.orders||[]).forEach(function(o){byId[o.id]=o;});
-  populateFilters();renderTotals();renderTiles();renderList();renderStats();
+  populateFilters();renderTotals();renderTiles();renderMsgBox();renderList();renderStats();
   if(panelOpenId&&byId[panelOpenId])fillPanel(byId[panelOpenId]);
+}
+function renderMsgBox(){
+  var box=document.getElementById('msgbox');var list=DATA.unreadMessages||[];
+  if(!list.length){box.innerHTML='';return;}
+  var rows=list.map(function(m){
+    var label='Order #'+esc(m.orderNo)+(m.vendor?' \\u00b7 '+esc(m.vendor):'');
+    return m.id
+      ? '<div class=msgboxrow onclick="openDetail(\\''+m.id+'\\')">\\uD83D\\uDCAC '+label+' <span class=msgboxgo>Open \\u203A</span></div>'
+      : '<div class="msgboxrow off">\\uD83D\\uDCAC '+label+' <span class=msgboxgo>(order not in list)</span></div>';
+  }).join('');
+  box.innerHTML='<div class=msgboxhead>\\uD83D\\uDCAC Unread messages ('+list.length+')</div>'+rows;
 }
 function renderTotals(){
   var t=DATA.totals||{};var v=function(n){return n==null?'0':n;};
@@ -1266,7 +1327,8 @@ function fillPanel(o){
     : '<div class=msgwrap><div class=tmpl-label>Messages</div><div class=msgempty style=text-align:left>Messaging opens once a vendor claims this order.</div></div>';
   panel.innerHTML='<div class=phead><div><div class=ptitle>Order '+esc(o.orderNo||o.id)+'</div><div class=peyebrow>'+esc(o.type||'')+(o.ref?' \\u00b7 PO '+esc(o.ref):'')+'</div></div><button class=pclose onclick="closeDetail()">\\u2715</button></div>'+
     '<div class=pbody>'+multi+'<div>'+badges+'</div>'+thumb+
-    '<div class=specline><b>Client:</b> '+esc(o.user||'?')+'</div>'+statusBlock+
+    '<div class=specline><b>Client:</b> '+esc(o.clientEmail||o.user||'?')+'</div>'+
+    '<div class=specline><b>Team:</b> '+esc(o.teamName||'\\u2013')+'</div>'+statusBlock+
     '<div class=specline><b>Created:</b> '+(o.createdHours!=null?fmtH(o.createdHours)+' ago':'\\u2013')+'</div>'+
     '<div class=uploadwrap><span class=tag>Assign / reassign to vendor</span><div style=display:flex;gap:8px;flex-wrap:wrap><select id=asgSel>'+(o.assigned?'':'<option value="">choose\\u2026</option>')+opts+'</select>'+
     '<button class=upload onclick="assignOrder(\\''+o.id+'\\')">'+(o.assigned?'Reassign':'Push')+'</button></div>'+
