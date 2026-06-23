@@ -275,6 +275,17 @@ function mountVendorPortal(app, deps) {
       const pool = await search("uploaded_image", [
         { key: F.claimState, constraint_type: "equals", value: CS.unclaimed }]);
       const claimable = pool.filter((o) => vendorCanDo(o, myCaps));
+      // OLDEST-FIRST, PER TYPE: only the single oldest unclaimed order of each type is
+      // claimable now; newer ones of that type are "next in line" (locked) so vendors
+      // can't cherry-pick ahead. Position within the type's line is sent for display.
+      claimable.sort((a, b) => new Date(a["Created Date"] || 0) - new Date(b["Created Date"] || 0));
+      const typeCount = {};
+      const claimableViews = claimable.map((o) => {
+        const type = o.Order_Type || "(none)";
+        typeCount[type] = (typeCount[type] || 0) + 1;
+        const pos = typeCount[type];
+        return { id: o._id, orderNo: o["Order#"] || "", type: o.Order_Type || "", locked: pos > 1, pos };
+      });
       const mine = await search("uploaded_image", [
         { key: F.assignedArtist, constraint_type: "equals", value: email },
         { key: F.claimState, constraint_type: "equals", value: CS.claimed }]);
@@ -328,7 +339,7 @@ function mountVendorPortal(app, deps) {
         monthlyTimer: sp.orderSpeed, monthlyEditTimer: sp.editSpeed,
         monthlyCount: sp.ordersMonth, monthlyEdits: sp.editsMonth,
         edits: editViews,
-        claimable: claimable.map((o) => ({ id: o._id, orderNo: o["Order#"] || "", type: o.Order_Type || "" })),
+        claimable: claimableViews,
         claimed: claimedViews,
       });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1109,6 +1120,8 @@ main{max-width:880px;margin:18px auto;padding:0 16px}
 .row{display:flex;align-items:center;gap:12px;padding:11px 14px;border-bottom:1px solid #f1f5f9;cursor:pointer;transition:background .12s}
 .row:last-child{border-bottom:0}.row:hover{background:#f8fafc}
 .row.av{border-left:3px solid #2563eb}.row.ed{border-left:3px solid #dc2626}.row.nopick{cursor:default}.row.nopick:hover{background:#fff}
+.row.locked{border-left:3px solid #e2e8f0;opacity:.6}
+.nextpill{font-size:11px;font-weight:700;color:#64748b;background:#f1f5f9;border:1px solid #e2e8f0;padding:4px 10px;border-radius:999px;white-space:nowrap}
 .rthumb{width:38px;height:38px;border-radius:8px;object-fit:cover;border:1px solid #e2e8f0;background:#f1f5f9;flex:none}
 .rthumb.ph{display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:17px}
 .rmain{flex:1;min-width:0}
@@ -1171,14 +1184,14 @@ async function load(){
   if(panelOpenId&&byId[panelOpenId])fillPanel(byId[panelOpenId]);
 }
 function renderChips(){
-  var av=(data.claimable||[]).length,ed=(data.edits||[]).length;
+  var av=(data.claimable||[]).filter(function(o){return !o.locked;}).length,ed=(data.edits||[]).length;
   var slots=(data.openCount!=null?data.openCount:0)+' of '+(data.limit!=null?data.limit:0);
   var full=!data.underLimit;
   var mt=(data.monthlyTimer!=null&&data.monthlyTimer!=='')?(data.monthlyTimer+'h'):'\\u2013';
   var met=(data.monthlyEditTimer!=null&&data.monthlyEditTimer!=='')?(data.monthlyEditTimer+'h'):'\\u2013';
   chips.innerHTML=
     (ed?'<span class="chip danger">'+ed+' edit'+(ed===1?'':'s')+'</span>':'')+
-    (av?'<span class="chip info">'+av+' to claim</span>':'')+
+    (av?'<span class="chip info">'+av+' ready to claim</span>':'')+
     '<span class=chip title="Avg turnaround this month \\u2014 orders (claim\\u2192done) / edits">Month \\u23F1 '+esc(String(mt))+' ord / '+esc(String(met))+' edit</span>'+
     '<span class="chip slots'+(full?' full':'')+'">'+slots+' slots</span>'+
     '<button class=logout onclick=logout()>Log out</button>';
@@ -1198,9 +1211,14 @@ function phThumb(){return '<div class="rthumb ph">\\u25A1</div>';}
 function shortUser(u){u=String(u);return (u.indexOf('@')>=0||u.length<=16)?u:(u.slice(0,12)+'\\u2026');}
 function rowHtml(o,state){
   if(state==='available'){
+    if(o.locked){
+      return '<div class="row av nopick locked"><div class="rthumb ph">\\u25A1</div>'+
+        '<div class=rmain><div class=rtitle>Order '+esc(o.orderNo||o.id)+'</div><div class=rsub>Next in line \\u00b7 #'+(o.pos||'?')+' in the '+esc(o.type||'')+' queue</div></div>'+
+        '<div class=rtype>'+esc(o.type||'')+'</div><div class=rright><span class=nextpill>Next in line</span></div></div>';
+    }
     var act=data.underLimit?'<button class=claim onclick="claim(\\''+o.id+'\\')">Claim</button>':'<span style=color:#94a3b8;font-size:13px>At limit</span>';
     return '<div class="row av nopick"><div class="rthumb ph">\\u25A1</div>'+
-      '<div class=rmain><div class=rtitle>Order '+esc(o.orderNo||o.id)+'<span class="mini m-new">New</span></div><div class=rsub>Waiting to be claimed</div></div>'+
+      '<div class=rmain><div class=rtitle>Order '+esc(o.orderNo||o.id)+'<span class="mini m-new">Next up</span></div><div class=rsub>Oldest '+esc(o.type||'')+' \\u2014 ready to claim</div></div>'+
       '<div class=rtype>'+esc(o.type||'')+'</div><div class=rright>'+act+'</div></div>';
   }
   var cls='row'+(state==='edit'?' ed':'');
@@ -1294,7 +1312,7 @@ function timerClass(since){
 async function claim(id){
   const r=await fetch('/vendor/api/claim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({orderId:id})});
   const d=await r.json();
-  if(!d.ok){alert(d.reason||d.error||'Could not claim');}
+  if(!d.ok){var m=d.reason==='claim_oldest_first'?'Please claim the oldest order in line first.':(d.reason==='at_limit_finish_open_work_first'?'You\\'re at your limit \\u2014 finish open work first.':(d.reason||d.error||'Could not claim'));alert(m);}
   panelOpenId=null;panel.classList.remove('open');backdrop.classList.remove('open');load();
 }
 async function submitPanel(id,emb){
