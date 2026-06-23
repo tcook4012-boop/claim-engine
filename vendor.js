@@ -26,6 +26,14 @@ const SESSION_HOURS = 12;
 
 function makeToken() { return crypto.randomBytes(32).toString("hex"); }
 
+// ---- Client completion email (SendGrid) ----
+// Key is read from the environment so the secret stays out of the code/repo.
+// Set SENDGRID_API_KEY in Railway's Variables tab.
+const SENDGRID_KEY = process.env.SENDGRID_API_KEY || "";
+const MAIL_FROM_EMAIL = "contact@printreadyart.com";
+const MAIL_FROM_NAME = "Print Ready Art";
+const MAIL_BCC = "contact@printreadyart.com"; // matches the current "bcc: me"; set "" for none
+
 // Required capabilities for an order (mirrors the engine, scoped-subset model):
 // type cap, plus separations only on Vector, ofm/pfx only on Digitizing.
 const TYPE_CAP = { "Vector": "vector", "Digitizing": "digitizing", "Digital (DTF/DTG)": "digital_printing" };
@@ -263,6 +271,44 @@ function mountVendorPortal(app, deps) {
     return out;
   }
 
+  // Send the "your order is ready" email to the client. Best-effort: any failure is
+  // logged and swallowed so a mail hiccup never blocks order completion.
+  async function sendCompletionEmail(o) {
+    try {
+      if (!SENDGRID_KEY) { console.warn("[email] SENDGRID_API_KEY not set -- skipping send"); return; }
+      // Recipient: order's own Email field if populated, else resolve the client from
+      // the User id -> user record -> authentication.email.email (nested in Bubble).
+      let to = (o.Email && String(o.Email).trim()) ? String(o.Email).trim() : "";
+      if (!to && o.User) {
+        try {
+          const u = await bubble("GET", `/user/${o.User}`).then((r) => r.response);
+          to = u && u.authentication && u.authentication.email && u.authentication.email.email
+            ? u.authentication.email.email : "";
+        } catch (e) { console.warn("[email] user lookup failed:", e.message); }
+      }
+      if (!to) { console.warn(`[email] no client email for order ${o["Order#"]} -- skipping send`); return; }
+      const orderNo = o["Order#"] || "";
+      const subject = `Your PrintReadyArt Order# ${orderNo} is Complete`;
+      const text = "Your order is ready!\n\nWe completed your files and uploaded them to your dashboard. Please login at PrintReadyArt.com to download the files.\n\nWe appreciate being part of your team!\n\nPrint Ready Art Team";
+      const html = "Your order is ready!<br><br>We completed your files and uploaded them to your dashboard. Please login at <a href=\"https://printreadyart.com\">PrintReadyArt.com</a> to download the files.<br><br>We appreciate being part of your team!<br><br>Print Ready Art Team";
+      const personalization = { to: [{ email: to }] };
+      if (MAIL_BCC && MAIL_BCC.toLowerCase() !== to.toLowerCase()) personalization.bcc = [{ email: MAIL_BCC }];
+      const payload = {
+        personalizations: [personalization],
+        from: { email: MAIL_FROM_EMAIL, name: MAIL_FROM_NAME },
+        subject,
+        content: [{ type: "text/plain", value: text }, { type: "text/html", value: html }],
+      };
+      const res = await fetch("https://api.sendgrid.com/v3/mail/send", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${SENDGRID_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (res.status >= 200 && res.status < 300) console.log(`[email] completion email sent to ${to} for order ${orderNo}`);
+      else console.warn(`[email] SendGrid ${res.status}: ${await res.text()}`);
+    } catch (e) { console.warn("[email] send failed:", e.message); }
+  }
+
   app.get("/vendor/api/orders", requireVendor, async (req, res) => {
     try {
       const email = effectiveEmail(req.session);
@@ -470,6 +516,18 @@ function mountVendorPortal(app, deps) {
       if (usedScratch) {
         try { await patchOrder(orderId, { vendor_scratch_file: "" }); }
         catch (e) { console.warn("[upload] scratch clear failed:", e.message); }
+      }
+
+      // Client "your order is ready" email. Fires on BOTH triggers: original order
+      // completion and edit-request completion. The original completion sends once per
+      // order (guarded by message_sent) so a re-upload won't double-send; an edit
+      // completion is its own client-facing event and always sends.
+      if (isEditSubmit) {
+        await sendCompletionEmail(o);
+      } else if (String(o.message_sent || "").toLowerCase() !== "yes") {
+        await sendCompletionEmail(o);
+        try { await patchOrder(orderId, { message_sent: "yes" }); }
+        catch (e) { console.warn("[email] message_sent flag write failed:", e.message); }
       }
 
       await logEvent(orderId, email, isEditSubmit ? "edit_revised" : "completed_uploaded",
