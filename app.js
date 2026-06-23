@@ -60,10 +60,14 @@ function requiredCapsForOrder(o) {
   const TYPE_CAP = { "Vector": "vector", "Digitizing": "digitizing", "Digital (DTF/DTG)": "digital_printing" };
   const t = TYPE_CAP[o.Order_Type];
   if (t) caps.push(t);
-  if (o[F.separations] === "yes" || o[F.separations] === true) caps.push("separations");
-  // Digitizing OFM/PXF requests -> ofm / pfx capabilities. Field is "PXF"; capability tag is "pfx".
-  if (o.OFM === "yes" || o.OFM === true) caps.push("ofm");
-  if (o.PXF === "yes" || o.PXF === true) caps.push("pfx");
+  // Sub-capabilities are SCOPED to their parent type (strict subset model):
+  //   separations belongs only to Vector; ofm/pfx belong only to Digitizing.
+  // This prevents nonsense requirements like [digitizing, separations].
+  if (o.Order_Type === "Vector" && (o[F.separations] === "yes" || o[F.separations] === true)) caps.push("separations");
+  if (o.Order_Type === "Digitizing") {
+    if (o.OFM === "yes" || o.OFM === true) caps.push("ofm");
+    if (o.PXF === "yes" || o.PXF === true) caps.push("pfx");
+  }
   return caps;
 }
 
@@ -95,9 +99,7 @@ async function artistByEmail(email) {
   const rows = await search("artist", [{ key: ART.email, constraint_type: "equals", value: email }]);
   const a = rows[0];
   return a ? { email, maxConcurrent: Number(a[ART.maxConcurrent] || 0),
-              capabilities: a[ART.capabilities] || [],
-              monthlyTimer: a.monthly_timer, monthlyEditTimer: a.monthly_edit_timer,
-              monthlyCount: a.monthly_counter } : null;
+              capabilities: a[ART.capabilities] || [] } : null;
 }
 const activeVendors = () =>
   search("artist", [{ key: ART.isActive, constraint_type: "equals", value: YES }])
@@ -106,13 +108,12 @@ const activeVendors = () =>
 async function eligibleVendors(order) {
   const need = requiredCapsForOrder(order);
   const all = await activeVendors();
-  if (!need.length) return all;
-  const capable = all.filter(v => need.every(c => (v.capabilities || []).map(x => String(x).toLowerCase()).includes(c)));
-  if (capable.length) return capable;
-  // No active vendor carries the required capabilities. Don't strand the order — fall
-  // back to all active vendors and warn loudly so an admin sets capabilities in the grid.
-  console.warn(`[routing] no vendor has caps [${need.join(", ")}] for order ${order._id} (type "${order.Order_Type}") -- falling back to all active vendors`);
-  return all;
+  if (!need.length) return all; // unrecognized type: no capability to gate on
+  // STRICT capability gating: only vendors who carry EVERY required capability.
+  // No fallback to all-active -- an order no one is capable of waits for an admin
+  // (surfaced on the dashboard as "no eligible vendor") rather than leaking to
+  // vendors who aren't set up for that work.
+  return all.filter(v => need.every(c => (v.capabilities || []).map(x => String(x).toLowerCase()).includes(c)));
 }
 // A vendor's "load" against their cap = active claimed work PLUS open edit requests
 // (edit requests are unpaid rework; counting them throttles new paid intake until edits
@@ -161,51 +162,41 @@ async function logEvent(orderId, email, eventType, note = "") {
 function notifyVendor(email) { console.log(`[notify] ${email} has an order to claim`); }
 
 async function startClock(orderId) {
-  const o = await getOrder(orderId);
-  const now = Date.now();
-  let assignee = o[F.assignedArtist];
-
-  // Auto-assign: if no artist is set, or the set artist isn't currently eligible,
-  // pick the next eligible active vendor (same round-robin rotation uses).
-  const eligible = await eligibleVendors(o);
-  const assigneeEligible = assignee && eligible.some(v => v.email === assignee);
-  if (!assigneeEligible) {
-    const picked = await pickNextVendor(o, new Set());
-    if (!picked) {
-      // No eligible vendor to start with. Don't park -- leave claim_state blank
-      // so the next sweep retries; the order waits in the queue until someone's available.
-      console.log(`[waiting] order ${orderId} -- no eligible vendor to assign yet, will retry`);
-      await logEvent(orderId, "", "waiting_no_vendor", "no eligible vendor available at start");
-      return;
-    }
-    if (!assignee) console.log(`[auto-assigned] order ${orderId} had no artist -> ${picked}`);
-    else           console.log(`[auto-assigned] order ${orderId} artist ${assignee} not eligible -> ${picked}`);
-    await logEvent(orderId, picked, "auto_assigned",
-      assignee ? `prior artist ${assignee} not eligible` : "no artist on order");
-    assignee = picked;
-  }
-
+  // SHARED POOL: an order simply enters the claimable pool -- unclaimed and
+  // unassigned. Every active, under-cap vendor whose capabilities match can see
+  // and claim it (first-claim-wins, enforced atomically in tryClaim under a lock).
+  // We intentionally do NOT pre-stamp Assigned_Artist, so no single vendor "owns"
+  // a waiting order and orders can't pile up on one person.
   await patchOrder(orderId, {
-    [F.claimState]: CS.unclaimed, [F.assignedArtist]: assignee,
-    [F.claimDeadline]: now + CLAIM_WINDOW_MIN * 60000,
-    [F.hardDeadline]:  now + HARD_CAP_MIN * 60000,
-    [F.lastAssigned]:  now, [F.rotationCount]: 0, [F.triedVendors]: [],
+    [F.claimState]: CS.unclaimed,
+    [F.assignedArtist]: "",
+    [F.lastAssigned]: Date.now(),
   });
-  console.log(`[clock started] order ${orderId} -> ${assignee}`);
-  await logEvent(orderId, assignee, "clock_started", `claim window ${CLAIM_WINDOW_MIN} min`);
-  notifyVendor(assignee);
+  const o = await getOrder(orderId);
+  const eligible = await eligibleVendors(o);
+  console.log(`[pool] order ${orderId} entered the shared claim pool -- ${eligible.length} eligible vendor(s)`);
+  await logEvent(orderId, "", "entered_pool", `shared pool; ${eligible.length} eligible`);
+  eligible.forEach(v => notifyVendor(v.email));
 }
 
 async function tryClaim(orderId, email) {
   const o = await getOrder(orderId);
-  if (o[F.claimState] !== CS.unclaimed) return { ok: false, reason: "already_taken_or_rotated" };
-  if (o[F.assignedArtist] !== email)    return { ok: false, reason: "not_your_order" };
+  const st = o[F.claimState] || "";
+  // Claimable only while still in the pool (blank or unclaimed). The per-order lock
+  // around this call makes first-claim-wins atomic: a second claimer reads "claimed".
+  if (st !== "" && st !== CS.unclaimed) return { ok: false, reason: "already_taken" };
   const a = await artistByEmail(email);
-  if (a && (await countClaimed(email)) >= a.maxConcurrent)
+  if (!a) return { ok: false, reason: "no_artist_with_that_email" };
+  // STRICT capability gate: the claimer must carry every capability the order needs.
+  const need = requiredCapsForOrder(o);
+  const caps = (a.capabilities || []).map(x => String(x).toLowerCase());
+  if (!need.every(c => caps.includes(c)))
+    return { ok: false, reason: "not_eligible_for_this_work" };
+  if ((await countClaimed(email)) >= a.maxConcurrent)
     return { ok: false, reason: "at_limit_finish_open_work_first" };
-  await patchOrder(orderId, { [F.claimState]: CS.claimed, [F.claimedAt]: Date.now() });
-  console.log(`[claimed] order ${orderId} by ${email}`);
-  await logEvent(orderId, email, "claimed", "");
+  await patchOrder(orderId, { [F.claimState]: CS.claimed, [F.assignedArtist]: email, [F.claimedAt]: Date.now() });
+  console.log(`[claimed] order ${orderId} by ${email} (from shared pool)`);
+  await logEvent(orderId, email, "claimed", "from shared pool");
   return { ok: true };
 }
 
@@ -300,16 +291,16 @@ async function rotateIfDue(o) {
 
 async function sweep() {
   try {
-    // 1) New flagged orders not yet started.
+    // 1) New flagged orders not yet started -> drop into the shared pool.
     const fresh = await search("uploaded_image", [
       { key: F.useNewSystem, constraint_type: "equals", value: YES },
       { key: F.claimState, constraint_type: "is_empty" },
     ]);
     for (const o of fresh) await withLock(o._id, () => startClock(o._id));
-    // 2) Rotate anything whose window expired.
-    const due = await search("uploaded_image", [{ key: F.claimState, constraint_type: "equals", value: CS.unclaimed }]);
-    for (const o of due) await withLock(o._id, () => rotateIfDue(o));
-    if (fresh.length || due.length) console.log(`[sweep] ${fresh.length} new, ${due.length} open`);
+    // 2) Open orders just wait in the shared pool for any eligible vendor to claim.
+    //    No rotation, no per-vendor window -- nothing to do but count them.
+    const open = await search("uploaded_image", [{ key: F.claimState, constraint_type: "equals", value: CS.unclaimed }]);
+    if (fresh.length || open.length) console.log(`[sweep] ${fresh.length} new -> pool, ${open.length} waiting in pool`);
   } catch (e) { console.error("[sweep error]", e.message); }
 }
 
