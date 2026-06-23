@@ -803,7 +803,11 @@ function mountVendorPortal(app, deps) {
         pending: pending.length,
         unassigned: pending.filter((o) => !isClaimed(o)).length,
         openEdits: openEdits.length,
-        aging: pending.filter((o) => { const h = hSinceClaim(o); return h != null && h > 8; }).length,
+        aging: pending.filter((o) => {
+          if (isClaimed(o)) { const h = hSinceClaim(o); return h != null && h > 14; }
+          const c = o["Created Date"] ? (now - new Date(o["Created Date"]).getTime()) / 3600000 : null;
+          return c != null && c > 3;
+        }).length,
         multiEdit: pending.filter((o) => o["Multiple Edit Alert"] === true).length,
         vector: pending.filter((o) => o.Order_Type === "Vector").length,
         digitizing: pending.filter((o) => o.Order_Type === "Digitizing").length,
@@ -822,7 +826,7 @@ function mountVendorPortal(app, deps) {
       };
       const orderSpeedH = (o) => { if (!o.claimed_at || !o["Modified Date"]) return null; const h = (new Date(o["Modified Date"]).getTime() - new Date(o.claimed_at).getTime()) / 3600000; return h >= 0 ? h : null; };
       const editSpeedH = (e) => { if (!e["Created Date"] || !e.Completed) return null; const h = (new Date(e.Completed).getTime() - new Date(e["Created Date"]).getTime()) / 3600000; return h >= 0 ? h : null; };
-      pending.forEach((o) => { if (!isClaimed(o)) return; const b = bucket(o[F.assignedArtist]); if (!b) return; b.op++; const h = hSinceClaim(o); if (h != null && h > 8) b.ag++; });
+      pending.forEach((o) => { if (!isClaimed(o)) return; const b = bucket(o[F.assignedArtist]); if (!b) return; b.op++; const h = hSinceClaim(o); if (h != null && h > 14) b.ag++; });
       openEdits.forEach((e) => { const b = bucket(e.Assigned_Artist); if (b) b.ep++; });
       try {
         const done = await search("uploaded_image", [
@@ -1095,6 +1099,16 @@ header a{color:#93c5fd;text-decoration:none;margin-left:14px;font-size:14px}
 .tab.active{background:#fff;color:#0f172a;box-shadow:0 -2px 0 #2563eb inset}
 .toppanels{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:14px}
 .totalpanel{background:#fff;border-radius:12px;padding:16px 20px;box-shadow:0 1px 3px rgba(0,0,0,.08);min-width:300px}
+.kpistrip{display:grid;grid-template-columns:repeat(auto-fit,minmax(116px,1fr));gap:10px;margin-bottom:10px}
+.kpi{background:#fff;border:1px solid #eef2f6;border-radius:10px;padding:11px 13px}
+.kpi .kn{font-size:22px;font-weight:800;color:#0f172a;line-height:1.1}
+.kpi .kl{font-size:12px;color:#64748b;margin-top:3px}
+.kpi.alert{background:#fef2f2;border-color:#fecaca}.kpi.alert .kn{color:#dc2626}.kpi.alert .kl{color:#b91c1c}
+.kpi.good{background:#f0fdf4;border-color:#bbf7d0}.kpi.good .kn{color:#16a34a}.kpi.good .kl{color:#15803d}
+.chiprow{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+.chip2{font-size:12px;background:#f1f5f9;color:#475569;padding:5px 11px;border-radius:999px}.chip2 b{color:#0f172a;font-weight:700}
+.chip2.click{cursor:pointer}.chip2.click:hover{filter:brightness(.97)}
+.chip2.alert{background:#fee2e2;color:#b91c1c}.chip2.alert b{color:#b91c1c}
 #msgbox:not(:empty){background:#eff6ff;border:1px solid #bfdbfe;border-radius:12px;padding:12px 16px;margin-bottom:14px}
 .msgboxhead{font-size:14px;font-weight:800;color:#1e40af;margin-bottom:8px}
 .msgboxrow{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;color:#1e3a8a}
@@ -1165,7 +1179,7 @@ table.stats td.g,table.stats td.o,table.stats td.r{font-weight:700}.g{color:#16a
 <div class=wrap>
 <div class=tabs><button class="tab active" id=tabOrders onclick="showTab('orders')">Orders</button><button class=tab id=tabVendors onclick="showTab('vendors')">By Vendor</button></div>
 <div id=paneOrders>
-  <div class=toppanels><div id=totalPanel class=totalpanel></div><div id=tiles class=tiles></div></div>
+  <div id=kpis></div>
   <div id=msgbox></div>
   <div class=toolbar>
     <label>Sort <select id=sortSel onchange="setSort(this.value)">
@@ -1186,7 +1200,8 @@ table.stats td.g,table.stats td.o,table.stats td.r{font-weight:700}.g{color:#16a
 let DATA={vendors:[],orders:[],artists:[],totals:{}},byId={},panelOpenId=null;
 let sortBy='placed',fltVendor='',fltState='',fltType='',fltMulti=false;
 function fmtH(h){if(h==null)return '\\u2013';if(h>=48)return (h/24).toFixed(1)+'d';return h+'h';}
-function ageClass(h){if(h==null)return 't-green';if(h>8)return 't-red';if(h>=6)return 't-orange';return 't-green';}
+function completionClass(h){if(h==null)return 't-green';if(h>14)return 't-red';if(h>=6)return 't-orange';return 't-green';}
+function claimAgeClass(h){if(h==null)return 't-green';if(h>3)return 't-red';if(h>=1.5)return 't-orange';return 't-green';}
 function spdClass(v){if(v==null)return '';if(v<5)return 'g';if(v<=10)return 'o';return 'r';}
 function pctClass(v){if(v==null)return '';if(v<10)return 'g';if(v<=15)return 'o';return 'r';}
 function esc(s){return String(s==null?'':s).replace(/[<>&]/g,function(c){return c==='<'?'&lt;':c==='>'?'&gt;':'&amp;';});}
@@ -1202,7 +1217,7 @@ async function load(){
   try{const r=await fetch('/vendor/api/admin/dashboard');DATA=await r.json();}
   catch(e){document.getElementById('orders').innerHTML='<div class=muted>Failed to load.</div>';return;}
   byId={};(DATA.orders||[]).forEach(function(o){byId[o.id]=o;});
-  populateFilters();renderTotals();renderTiles();renderMsgBox();renderList();renderStats();
+  populateFilters();renderKpis();renderMsgBox();renderList();renderStats();
   if(panelOpenId&&byId[panelOpenId])fillPanel(byId[panelOpenId]);
 }
 function renderMsgBox(){
@@ -1216,23 +1231,26 @@ function renderMsgBox(){
   }).join('');
   box.innerHTML='<div class=msgboxhead>\\uD83D\\uDCAC Unread messages ('+list.length+')</div>'+rows;
 }
-function renderTotals(){
+function renderKpis(){
   var t=DATA.totals||{};var v=function(n){return n==null?'0':n;};
-  document.getElementById('totalPanel').innerHTML='<h3>Total</h3>'+
-    '<div class=r>Pending Orders: <span>'+v(t.pending)+'</span></div>'+
-    '<div class="r tp-red">Aging Orders: <span>'+v(t.aging)+'</span></div>'+
-    '<div class=r>Edits Pending: <span>'+v(t.openEdits)+'</span></div>'+
-    '<div class="r tp-orange tp-click" onclick="filterMulti()">Multiple Edit Alerts: <span>'+v(t.multiEdit)+'</span></div>'+
-    '<div class=r>Edits Completed Today: <span>'+v(t.editsToday)+'</span></div>'+
-    '<div class=r>Orders Completed Today: <span>'+v(t.completedToday)+'</span></div>'+
-    '<div class=r>Orders Completed This Month: <span>'+v(t.completedMonth)+'</span></div>';
-}
-function renderTiles(){
-  var t=DATA.totals||{};function tile(n,l,w){return '<div class="tile'+(w&&n?' warn':'')+'"><div class=n>'+(n==null?'0':n)+'</div><div class=l>'+l+'</div></div>';}
   var un=(DATA.orders||[]).filter(function(o){return !o.assigned;});
   var oldest=0;un.forEach(function(o){if(o.createdHours!=null&&o.createdHours>oldest)oldest=o.createdHours;});
-  var oldestTile='<div class="tile'+(un.length?' warn':'')+'"><div class=n>'+(un.length?fmtH(oldest):'\\u2013')+'</div><div class=l>Oldest unclaimed</div></div>';
-  document.getElementById('tiles').innerHTML=tile(t.unassigned,'Unassigned',true)+oldestTile+tile(t.vector,'Vector')+tile(t.digitizing,'Digitizing')+tile(t.digital,'Digital (DTF/DTG)')+tile(t.other,'Other / unknown',true);
+  var oldestStr=un.length?fmtH(oldest):'\\u2013';
+  function kpi(n,l,cls){return '<div class="kpi'+(cls?' '+cls:'')+'"><div class=kn>'+n+'</div><div class=kl>'+l+'</div></div>';}
+  var strip=kpi(v(t.aging),'Aging',t.aging?'alert':'')+
+    kpi(v(t.unassigned),'Unassigned',t.unassigned?'alert':'')+
+    kpi(v(t.pending),'Pending')+
+    kpi(v(t.openEdits),'Edits pending')+
+    kpi(oldestStr,'Oldest unclaimed')+
+    kpi(v(t.completedToday),'Done today')+
+    kpi(v(t.editsToday),'Edits today')+
+    kpi(v(t.completedMonth),'Done / month',t.completedMonth?'good':'');
+  var chips='<span class=chip2>Vector <b>'+v(t.vector)+'</b></span>'+
+    '<span class=chip2>Digitizing <b>'+v(t.digitizing)+'</b></span>'+
+    '<span class=chip2>Digital <b>'+v(t.digital)+'</b></span>'+
+    '<span class=chip2>Other <b>'+v(t.other)+'</b></span>'+
+    '<span class="chip2 click'+(t.multiEdit?' alert':'')+'" onclick="filterMulti()">Multiple edits <b>'+v(t.multiEdit)+'</b></span>';
+  document.getElementById('kpis').innerHTML='<div class=kpistrip>'+strip+'</div><div class=chiprow>'+chips+'</div>';
 }
 function populateFilters(){
   var vsel=document.getElementById('fVendor');var cur=vsel.value;
@@ -1269,8 +1287,8 @@ function rowHtml(o){
   var assigned=o.assigned?esc(shortUser(o.assigned)):'<span class="mini m-un">Unassigned</span>';
   var marks=(o.unread?'<span class="mini msgnew">\\uD83D\\uDCAC New</span>':'')+(o.separations==='yes'?'<span class="mini m-sep">Sep</span>':'')+(o.rush==='yes'?'<span class="mini m-rush">Rush</span>':'')+(o.multiEdit?'<span class="mini m-multi">\\u26A0 Multi-edit</span>':'');
   var pill=(o.claimedHours!=null)
-    ? '<div class="timer '+ageClass(o.claimedHours)+'" title="Time held since claimed">'+fmtH(o.claimedHours)+'</div>'
-    : '<div class="timer '+ageClass(o.createdHours)+'" title="Unclaimed \\u2014 time since placed">\\u231B '+fmtH(o.createdHours)+'</div>';
+    ? '<div class="timer '+completionClass(o.claimedHours)+'" title="Time held since claimed">'+fmtH(o.claimedHours)+'</div>'
+    : '<div class="timer '+claimAgeClass(o.createdHours)+'" title="Unclaimed \\u2014 time since placed">\\u231B '+fmtH(o.createdHours)+'</div>';
   return '<div class="row'+(o.multiEdit?' multi':'')+'" onclick="openDetail(\\''+o.id+'\\')">'+thumb+
     '<div class=rmain><div class=rtitle>Order '+esc(o.orderNo||o.id)+marks+'</div><div class=rsub>'+esc(o.type||'(no type)')+' \\u00b7 '+esc(shortUser(o.user||'?'))+'</div></div>'+
     '<div class=rasg>'+assigned+'</div><div class=rright>'+pill+'<i class=chev>\\u203A</i></div></div>';
@@ -1599,7 +1617,7 @@ function timerClass(since){
   if(!since)return 't-green';
   var h=(Date.now()-new Date(since).getTime())/3600000;
   if(isNaN(h))return 't-green';
-  if(h>8)return 't-red';if(h>=6)return 't-orange';return 't-green';
+  if(h>14)return 't-red';if(h>=6)return 't-orange';return 't-green';
 }
 async function claim(id){
   const r=await fetch('/vendor/api/claim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({orderId:id})});
