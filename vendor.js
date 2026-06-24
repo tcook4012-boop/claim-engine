@@ -792,6 +792,18 @@ function mountVendorPortal(app, deps) {
       const now = Date.now();
       const editsByVendor = {};
       openEdits.forEach((e) => { const a = String(e.Assigned_Artist || "").toLowerCase(); if (a) editsByVendor[a] = (editsByVendor[a] || 0) + 1; });
+      // Open edits keyed by Order# so we can badge the order rows and show edit details.
+      const linkifyD = (v) => (!v ? null : (String(v).startsWith("//") ? "https:" + v : String(v)));
+      const editByNo = {};
+      openEdits.forEach((er) => {
+        const no = String(er["Order#"] || ""); if (!no) return;
+        if (!editByNo[no]) editByNo[no] = {
+          changes: er.Changes_Needed || "", reason: er.Edit_Reason || "",
+          artist: er.Assigned_Artist || "", created: er["Created Date"] || null,
+          refs: [["Reference 1", er.File_1], ["Reference 2", er.File_2]]
+            .map(([label, v]) => { const u = linkifyD(v); return u ? { label, url: u } : null; }).filter(Boolean),
+        };
+      });
       // An order is only ACTUALLY claimed when claim_state === "claimed". The engine
       // pre-stamps nothing now (shared pool), but legacy rows may still carry a stamp;
       // claim_state is the only source of truth for "claimed".
@@ -799,6 +811,7 @@ function mountVendorPortal(app, deps) {
       const orders = pending.map((o) => {
         const created = o["Created Date"] ? (now - new Date(o["Created Date"]).getTime()) / 3600000 : null;
         const claimed = (isClaimed(o) && o.claimed_at) ? (now - new Date(o.claimed_at).getTime()) / 3600000 : null;
+        const edit = editByNo[String(o["Order#"] || "")] || null;
         return {
           id: o._id, orderNo: o["Order#"] || "", ref: o["Customer_PO#"] || "", type: o.Order_Type || "",
           user: o.User || "", teamId: o.Team_Name || "", state: o[F.claimState] || "",
@@ -809,6 +822,7 @@ function mountVendorPortal(app, deps) {
           claimedHours: claimed != null ? +claimed.toFixed(2) : null,
           separations: o[F.separations] || "no", rush: o.Rush || "no",
           multiEdit: o["Multiple Edit Alert"] === true,
+          hasEdit: !!edit, edit: edit,
         };
       }).sort((a, b) => {
         const av = a.claimedHours != null ? a.claimedHours : -1, bv = b.claimedHours != null ? b.claimedHours : -1;
@@ -1131,6 +1145,8 @@ header a{color:#93c5fd;text-decoration:none;margin-left:14px;font-size:14px}
 .kpi .kl{font-size:12px;color:#64748b;margin-top:3px}
 .kpi.alert{background:#fef2f2;border-color:#fecaca}.kpi.alert .kn{color:#dc2626}.kpi.alert .kl{color:#b91c1c}
 .kpi.good{background:#f0fdf4;border-color:#bbf7d0}.kpi.good .kn{color:#16a34a}.kpi.good .kl{color:#15803d}
+.kpi.clickk{cursor:pointer}.kpi.clickk:hover{filter:brightness(.98)}
+.mini.m-editreq{background:#fde68a;color:#92400e}
 .chiprow{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}
 .chip2{font-size:12px;background:#f1f5f9;color:#475569;padding:5px 11px;border-radius:999px}.chip2 b{color:#0f172a;font-weight:700}
 .chip2.click{cursor:pointer}.chip2.click:hover{filter:brightness(.97)}
@@ -1184,6 +1200,9 @@ table.stats td.g,table.stats td.o,table.stats td.r{font-weight:700}.g{color:#16a
 .specline{font-size:13px;color:#334155;margin:4px 0}.specline b{color:#0f172a}
 .multibanner{display:flex;gap:8px;background:#fee2e2;color:#991b1b;border-radius:8px;padding:9px 12px;font-size:13px;font-weight:700;margin-bottom:12px}
 .eligbox{margin-top:10px;padding:10px 12px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px}
+.editreqbox{margin:10px 0;padding:10px 12px;background:#fffbeb;border:1px solid #fde68a;border-radius:8px}
+.editreqbox .tmpl-label{color:#92400e}
+.eref{display:inline-block;margin-right:8px;color:#2563eb;font-size:13px;text-decoration:underline}
 .msgwrap{margin-top:16px;border-top:1px solid #eef2f6;padding-top:14px}
 .thread{max-height:240px;overflow-y:auto;background:#f8fafc;border:1px solid #eef2f6;border-radius:8px;padding:10px;display:flex;flex-direction:column;gap:8px}
 .msgempty{color:#94a3b8;font-size:13px;text-align:center;padding:14px}
@@ -1208,12 +1227,15 @@ table.stats td.g,table.stats td.o,table.stats td.r{font-weight:700}.g{color:#16a
   <div id=kpis></div>
   <div id=msgbox></div>
   <div class=toolbar>
+    <label>Search <input id=fSearch type=text placeholder="Order #" oninput="setFilter()" style=width:120px></label>
     <label>Sort <select id=sortSel onchange="setSort(this.value)">
       <option value=placed>Time since placed</option><option value=held>Time held (claimed)</option><option value=vendor>Vendor</option><option value=type>Type</option><option value=multi>Multiple edits first</option></select></label>
     <label>Vendor <select id=fVendor onchange="setFilter()"><option value="">All</option></select></label>
+    <label>Client <select id=fClient onchange="setFilter()"><option value="">All</option></select></label>
     <label>State <select id=fState onchange="setFilter()"><option value="">All</option><option value=unassigned>Unassigned</option><option value=assigned>Assigned</option></select></label>
     <label>Type <select id=fType onchange="setFilter()"><option value="">All</option></select></label>
     <label><input type=checkbox id=fMulti onchange="setFilter()"> Multiple edits only</label>
+    <label><input type=checkbox id=fEdit onchange="setFilter()"> Edit requests only</label>
     <span id=lcount class=osub></span>
   </div>
   <div id=orders class=list></div>
@@ -1224,7 +1246,7 @@ table.stats td.g,table.stats td.o,table.stats td.r{font-weight:700}.g{color:#16a
 <div id=panel></div>
 <script>
 let DATA={vendors:[],orders:[],artists:[],totals:{}},byId={},panelOpenId=null;
-let sortBy='placed',fltVendor='',fltState='',fltType='',fltMulti=false;
+let sortBy='placed',fltVendor='',fltState='',fltType='',fltMulti=false,fltEdit=false,fltSearch='',fltClient='';
 function fmtH(h){if(h==null)return '\\u2013';if(h>=48)return (h/24).toFixed(1)+'d';return h+'h';}
 function completionClass(h){if(h==null)return 't-green';if(h>14)return 't-red';if(h>=6)return 't-orange';return 't-green';}
 function claimAgeClass(h){if(h==null)return 't-green';if(h>3)return 't-red';if(h>=1.5)return 't-orange';return 't-green';}
@@ -1262,11 +1284,11 @@ function renderKpis(){
   var un=(DATA.orders||[]).filter(function(o){return !o.assigned;});
   var oldest=0;un.forEach(function(o){if(o.createdHours!=null&&o.createdHours>oldest)oldest=o.createdHours;});
   var oldestStr=un.length?fmtH(oldest):'\\u2013';
-  function kpi(n,l,cls){return '<div class="kpi'+(cls?' '+cls:'')+'"><div class=kn>'+n+'</div><div class=kl>'+l+'</div></div>';}
+  function kpi(n,l,cls,oc){return '<div class="kpi'+(cls?' '+cls:'')+(oc?' clickk':'')+'"'+(oc?' onclick="'+oc+'"':'')+'><div class=kn>'+n+'</div><div class=kl>'+l+'</div></div>';}
   var strip=kpi(v(t.aging),'Aging',t.aging?'alert':'')+
     kpi(v(t.unassigned),'Unassigned',t.unassigned?'alert':'')+
     kpi(v(t.pending),'Pending')+
-    kpi(v(t.openEdits),'Edits pending')+
+    kpi(v(t.openEdits),'Edits pending','',t.openEdits?'filterEdits()':'')+
     kpi(oldestStr,'Oldest unclaimed')+
     kpi(v(t.completedToday),'Done today')+
     kpi(v(t.editsToday),'Edits today')+
@@ -1285,16 +1307,24 @@ function populateFilters(){
   var tsel=document.getElementById('fType');var curt=tsel.value;var types=[];
   (DATA.orders||[]).forEach(function(o){var tp=o.type||'(none)';if(types.indexOf(tp)<0)types.push(tp);});
   tsel.innerHTML='<option value="">All</option>'+types.map(function(tp){return '<option value="'+esc(tp)+'">'+esc(tp)+'</option>';}).join('');tsel.value=curt;
+  var csel=document.getElementById('fClient');var curc=csel.value;var clients=[];
+  (DATA.orders||[]).forEach(function(o){var c=o.clientEmail||'';if(c&&clients.indexOf(c)<0)clients.push(c);});
+  clients.sort();
+  csel.innerHTML='<option value="">All</option>'+clients.map(function(c){return '<option value="'+esc(c)+'">'+esc(c)+'</option>';}).join('');csel.value=curc;
 }
 function setSort(v){sortBy=v;renderList();}
-function setFilter(){fltVendor=document.getElementById('fVendor').value;fltState=document.getElementById('fState').value;fltType=document.getElementById('fType').value;fltMulti=document.getElementById('fMulti').checked;renderList();}
+function setFilter(){fltVendor=document.getElementById('fVendor').value;fltState=document.getElementById('fState').value;fltType=document.getElementById('fType').value;fltMulti=document.getElementById('fMulti').checked;fltEdit=document.getElementById('fEdit').checked;fltSearch=document.getElementById('fSearch').value.trim().toLowerCase();fltClient=document.getElementById('fClient').value;renderList();}
 function filterMulti(){document.getElementById('fMulti').checked=true;showTab('orders');setFilter();}
+function filterEdits(){document.getElementById('fEdit').checked=true;showTab('orders');setFilter();}
 function applyFilter(arr){return arr.filter(function(o){
   if(fltVendor&&o.assigned!==fltVendor)return false;
+  if(fltClient&&(o.clientEmail||'')!==fltClient)return false;
   if(fltState==='unassigned'&&o.assigned)return false;
   if(fltState==='assigned'&&!o.assigned)return false;
   if(fltType&&(o.type||'(none)')!==fltType)return false;
   if(fltMulti&&!o.multiEdit)return false;
+  if(fltEdit&&!o.hasEdit)return false;
+  if(fltSearch&&String(o.orderNo||'').toLowerCase().indexOf(fltSearch)<0)return false;
   return true;});}
 function applySort(arr){arr.sort(function(a,b){
   if(sortBy==='placed')return (b.createdHours||0)-(a.createdHours||0);
@@ -1311,12 +1341,12 @@ function renderList(){
 function rowHtml(o){
   var thumb=o.thumb?'<img class=rthumb src="'+o.thumb+'" onerror="this.outerHTML=phThumb()">':phThumb();
   var assigned=o.assigned?esc(shortUser(o.assigned)):'<span class="mini m-un">Unassigned</span>';
-  var marks=(o.unread?'<span class="mini msgnew">\\uD83D\\uDCAC New</span>':'')+(o.separations==='yes'?'<span class="mini m-sep">Sep</span>':'')+(o.rush==='yes'?'<span class="mini m-rush">Rush</span>':'')+(o.multiEdit?'<span class="mini m-multi">\\u26A0 Multi-edit</span>':'');
+  var marks=(o.unread?'<span class="mini msgnew">\\uD83D\\uDCAC New</span>':'')+(o.hasEdit?'<span class="mini m-editreq">\\u270E Edit</span>':'')+(o.separations==='yes'?'<span class="mini m-sep">Sep</span>':'')+(o.rush==='yes'?'<span class="mini m-rush">Rush</span>':'')+(o.multiEdit?'<span class="mini m-multi">\\u26A0 Multi-edit</span>':'');
   var pill=(o.claimedHours!=null)
     ? '<div class="timer '+completionClass(o.claimedHours)+'" title="Time held since claimed">'+fmtH(o.claimedHours)+'</div>'
     : '<div class="timer '+claimAgeClass(o.createdHours)+'" title="Unclaimed \\u2014 time since placed">\\u231B '+fmtH(o.createdHours)+'</div>';
   return '<div class="row'+(o.multiEdit?' multi':'')+'" onclick="openDetail(\\''+o.id+'\\')">'+thumb+
-    '<div class=rmain><div class=rtitle>Order '+esc(o.orderNo||o.id)+marks+'</div><div class=rsub>'+esc(o.type||'(no type)')+' \\u00b7 '+esc(shortUser(o.user||'?'))+'</div></div>'+
+    '<div class=rmain><div class=rtitle>Order '+esc(o.orderNo||o.id)+marks+'</div><div class=rsub>'+esc(o.type||'(no type)')+' \\u00b7 '+esc(shortUser(o.clientEmail||o.user||'?'))+'</div></div>'+
     '<div class=rasg>'+assigned+'</div><div class=rright>'+pill+'<i class=chev>\\u203A</i></div></div>';
 }
 function renderStats(){
@@ -1368,8 +1398,20 @@ function fillPanel(o){
   var msgBlock=claimed
     ? '<div class=msgwrap><div class=tmpl-label>Messages with '+esc(o.assigned||'vendor')+'</div><div id=thread class=thread>Loading\\u2026</div><div class=msgrow><textarea id=msgInput rows=2 placeholder="Write a message\\u2026"></textarea><button class=msgsend onclick="sendMsg(\\''+esc(o.orderNo)+'\\')">Send</button></div></div>'
     : '<div class=msgwrap><div class=tmpl-label>Messages</div><div class=msgempty style=text-align:left>Messaging opens once a vendor claims this order.</div></div>';
+  var editReq='';
+  if(o.hasEdit&&o.edit){
+    var er=o.edit;
+    var refs=(er.refs&&er.refs.length)?er.refs.map(function(r){return '<a href="'+r.url+'" target=_blank class=eref>'+esc(r.label)+'</a>';}).join(' '):'';
+    var erAgo=er.created?fmtH(+(((Date.now()-new Date(er.created).getTime())/3600000)).toFixed(2))+' ago':'';
+    editReq='<div class=editreqbox><div class=tmpl-label>\\u270E Edit requested by client</div>'+
+      (er.changes?'<div class=specline><b>Changes:</b> '+esc(er.changes)+'</div>':'')+
+      (er.reason?'<div class=specline><b>Reason:</b> '+esc(er.reason)+'</div>':'')+
+      (er.artist?'<div class=specline><b>Working it:</b> '+esc(shortUser(er.artist))+'</div>':'')+
+      (erAgo?'<div class=specline><b>Requested:</b> '+esc(erAgo)+'</div>':'')+
+      (refs?'<div class=specline><b>References:</b> '+refs+'</div>':'')+'</div>';
+  }
   panel.innerHTML='<div class=phead><div><div class=ptitle>Order '+esc(o.orderNo||o.id)+'</div><div class=peyebrow>'+esc(o.type||'')+(o.ref?' \\u00b7 PO '+esc(o.ref):'')+'</div></div><button class=pclose onclick="closeDetail()">\\u2715</button></div>'+
-    '<div class=pbody>'+multi+'<div>'+badges+'</div>'+thumb+
+    '<div class=pbody>'+multi+'<div>'+badges+'</div>'+thumb+editReq+
     '<div class=specline><b>Client:</b> '+esc(o.clientEmail||o.user||'?')+'</div>'+
     '<div class=specline><b>Team:</b> '+esc(o.teamName||'\\u2013')+'</div>'+statusBlock+
     '<div class=specline><b>Created:</b> '+(o.createdHours!=null?fmtH(o.createdHours)+' ago':'\\u2013')+'</div>'+
