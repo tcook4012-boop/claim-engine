@@ -471,9 +471,21 @@ function mountVendorPortal(app, deps) {
       } catch (e) { console.warn("[orders] edit_request lookup failed:", e.message); }
       // Cap load = claimed work + open edits (matches the engine's countClaimed). Open
       // edits consume slots so a vendor can't take new work until edits are cleared.
+      // Per-bucket load (a): digitizing vs other (vector+digital). Edits count against
+      // their original order's bucket. Each bucket has its own cap.
+      const capDig = a ? a.capDigitizing : 0;
+      const capOther = a ? a.capOther : 0;
+      const isDig = (t) => (t || "") === "Digitizing";
+      const digClaimed = mine.filter((o) => isDig(o.Order_Type)).length;
+      const otherClaimed = mine.length - digClaimed;
+      const digEdits = openEdits.filter((er) => isDig(er.Order_Type)).length;
+      const otherEdits = openEdits.length - digEdits;
       const editCount = openEdits.length;
+      const digLoad = digClaimed + digEdits;
+      const otherLoad = otherClaimed + otherEdits;
       const load = mine.length + editCount;
-      const underLimit = load < limit;
+      const underDig = digLoad < capDig;
+      const underOther = otherLoad < capOther;
       const editViews = await Promise.all(openEdits.map(async (er) => {
         let order = null;
         try {
@@ -506,7 +518,8 @@ function mountVendorPortal(app, deps) {
         editViews.forEach((v) => { if (unreadSet.has(String(v.orderNo))) v.unread = true; });
       } catch (e) { console.warn("[orders] unread scan failed:", e.message); }
       res.json({
-        email, limit, openCount: load, claimedCount: mine.length, editCount, underLimit,
+        email, limit, openCount: load, claimedCount: mine.length, editCount,
+        capDig, capOther, digLoad, otherLoad, underDig, underOther,
         actingAs: req.session.actingAs || null,
         monthlyTimer: sp.orderSpeed, monthlyEditTimer: sp.editSpeed,
         monthlyCount: sp.ordersMonth, monthlyEdits: sp.editsMonth,
@@ -702,8 +715,10 @@ function mountVendorPortal(app, deps) {
         capabilities: Array.isArray(req.body.capabilities)
           ? [...new Set(req.body.capabilities.map((s) => String(s).toLowerCase().trim()).filter(Boolean))] : [],
       };
-      if (req.body.maxConcurrent !== undefined && req.body.maxConcurrent !== "" && req.body.maxConcurrent !== null)
-        rec.max_concurrent_orders = Number(req.body.maxConcurrent);
+      if (req.body.maxDigitizing !== undefined && req.body.maxDigitizing !== "" && req.body.maxDigitizing !== null)
+        rec.max_concurrent_digitizing = Number(req.body.maxDigitizing);
+      if (req.body.maxOther !== undefined && req.body.maxOther !== "" && req.body.maxOther !== null)
+        rec.max_concurrent_orders = Number(req.body.maxOther);
       if (req.body.phone) rec["phone number"] = String(req.body.phone).trim();
       await bubble("POST", "/artist", rec);
       console.log(`[admin] new vendor created: ${email}`);
@@ -738,7 +753,8 @@ function mountVendorPortal(app, deps) {
         email: (a.email || "").toLowerCase(),
         contact: a.contact || "",
         capabilities: Array.isArray(a.capabilities) ? a.capabilities.map((c) => String(c).toLowerCase()) : [],
-        maxConcurrent: (a.max_concurrent_orders === 0 || a.max_concurrent_orders) ? a.max_concurrent_orders : "",
+        maxDigitizing: (a.max_concurrent_digitizing === 0 || a.max_concurrent_digitizing) ? a.max_concurrent_digitizing : (a.Max_concurrent_digitizing != null ? a.Max_concurrent_digitizing : ""),
+        maxOther: (a.max_concurrent_orders === 0 || a.max_concurrent_orders) ? a.max_concurrent_orders : (a.Max_concurrent_orders != null ? a.Max_concurrent_orders : ""),
         active: a.is_active_vendor === true,
       })).sort((x, y) => (x.email > y.email ? 1 : -1));
       res.json(rows);
@@ -753,8 +769,10 @@ function mountVendorPortal(app, deps) {
       const patch = {};
       if (Array.isArray(req.body.capabilities))
         patch.capabilities = [...new Set(req.body.capabilities.map((s) => String(s).toLowerCase().trim()).filter(Boolean))];
-      if (req.body.maxConcurrent !== undefined && req.body.maxConcurrent !== "" && req.body.maxConcurrent !== null)
-        patch.max_concurrent_orders = Number(req.body.maxConcurrent);
+      if (req.body.maxDigitizing !== undefined)
+        patch.max_concurrent_digitizing = (req.body.maxDigitizing === "" || req.body.maxDigitizing === null) ? 0 : Number(req.body.maxDigitizing);
+      if (req.body.maxOther !== undefined)
+        patch.max_concurrent_orders = (req.body.maxOther === "" || req.body.maxOther === null) ? 0 : Number(req.body.maxOther);
       if (typeof req.body.active === "boolean")
         patch.is_active_vendor = req.body.active;
       await bubble("PATCH", `/artist/${id}`, patch);
@@ -821,13 +839,13 @@ function mountVendorPortal(app, deps) {
       const byV = {};
       const bucket = (email) => {
         email = String(email || "").toLowerCase(); if (!email) return null;
-        if (!byV[email]) byV[email] = { op: 0, ag: 0, ep: 0, ot: 0, om: 0, et: 0, em: 0, osT: [0, 0], osM: [0, 0], esM: [0, 0] };
+        if (!byV[email]) byV[email] = { op: 0, ag: 0, ep: 0, ot: 0, om: 0, et: 0, em: 0, osT: [0, 0], osM: [0, 0], esM: [0, 0], digOp: 0, otherOp: 0, digEp: 0, otherEp: 0 };
         return byV[email];
       };
       const orderSpeedH = (o) => { if (!o.claimed_at || !o["Modified Date"]) return null; const h = (new Date(o["Modified Date"]).getTime() - new Date(o.claimed_at).getTime()) / 3600000; return h >= 0 ? h : null; };
       const editSpeedH = (e) => { if (!e["Created Date"] || !e.Completed) return null; const h = (new Date(e.Completed).getTime() - new Date(e["Created Date"]).getTime()) / 3600000; return h >= 0 ? h : null; };
-      pending.forEach((o) => { if (!isClaimed(o)) return; const b = bucket(o[F.assignedArtist]); if (!b) return; b.op++; const h = hSinceClaim(o); if (h != null && h > 14) b.ag++; });
-      openEdits.forEach((e) => { const b = bucket(e.Assigned_Artist); if (b) b.ep++; });
+      pending.forEach((o) => { if (!isClaimed(o)) return; const b = bucket(o[F.assignedArtist]); if (!b) return; b.op++; if ((o.Order_Type || "") === "Digitizing") b.digOp++; else b.otherOp++; const h = hSinceClaim(o); if (h != null && h > 14) b.ag++; });
+      openEdits.forEach((e) => { const b = bucket(e.Assigned_Artist); if (!b) return; b.ep++; if ((e.Order_Type || "") === "Digitizing") b.digEp++; else b.otherEp++; });
       try {
         const done = await search("uploaded_image", [
           { key: F.claimState, constraint_type: "equals", value: "completed" },
@@ -854,11 +872,16 @@ function mountVendorPortal(app, deps) {
       } catch (e) { console.warn("[dashboard] editsMonth failed:", e.message); totals.editsMonth = null; }
 
       const avg = (pair) => (pair && pair[1]) ? +(pair[0] / pair[1]).toFixed(2) : null;
+      const num = (a, ...ks) => { for (const k of ks) { const v = a[k]; if (v !== undefined && v !== null && v !== "") return Number(v) || 0; } return 0; };
       const artistRows = artists.map((a) => {
         const em = String(a.email || "").toLowerCase(); const b = byV[em] || {};
         const om = b.om || 0, emc = b.em || 0;
+        const capDig = num(a, "max_concurrent_digitizing", "Max_concurrent_digitizing");
+        const capOther = num(a, "max_concurrent_orders", "Max_concurrent_orders");
         return {
-          email: em, contact: a.contact || "", active: a.is_active_vendor === true, cap: a.max_concurrent_orders,
+          email: em, contact: a.contact || "", active: a.is_active_vendor === true,
+          cap: capDig + capOther, capDig, capOther,
+          digLoad: (b.digOp || 0) + (b.digEp || 0), otherLoad: (b.otherOp || 0) + (b.otherEp || 0),
           capabilities: Array.isArray(a.capabilities) ? a.capabilities.map((c) => String(c).toLowerCase()) : [],
           ordersPending: b.op || 0, editsPending: b.ep || 0, aging: b.ag || 0,
           orderSpeedToday: avg(b.osT), orderSpeedMonth: avg(b.osM), editSpeedMonth: avg(b.esM),
@@ -1028,23 +1051,25 @@ function render(){
   if(!Array.isArray(vendors)||!vendors.length){grid.textContent='No vendors found.';return;}
   let head='<tr><th class=vh>Vendor</th>';
   columns.forEach(function(c){head+='<th>'+c.label+'</th>';});
-  head+='<th>Active</th><th>Max</th></tr>';
+  head+='<th>Active</th><th>Max digitizing</th><th>Max other</th></tr>';
   let rows='';
   vendors.forEach(function(v,i){
     const caps=new Set((v.capabilities||[]).map(function(c){return String(c).toLowerCase();}));
     // An active vendor can't actually receive work if they have no email (system finds
-    // vendors only by email), no capabilities, or a zero/blank max. Flag it loudly.
-    var maxv=v.maxConcurrent;var maxOk=(maxv!==''&&maxv!=null&&Number(maxv)>0);
+    // vendors only by email), no capabilities, or BOTH caps zero/blank. Flag it loudly.
+    var md=v.maxDigitizing,mo=v.maxOther;
+    var bothEmpty=!((md!==''&&md!=null&&Number(md)>0)||(mo!==''&&mo!=null&&Number(mo)>0));
     var problems=[];
     if(v.active&&!(v.email&&String(v.email).trim()))problems.push('no email \\u2014 cannot be found');
     if(v.active&&caps.size===0)problems.push('no capabilities');
-    if(v.active&&!maxOk)problems.push('max is 0/blank');
+    if(v.active&&bothEmpty)problems.push('both maxes 0/blank');
     var warn=problems.length?' warnrow':'';
     rows+='<tr data-i="'+i+'" class="'+warn.trim()+'"><td class=vh><div class=vemail>'+(v.email||'<span class=nomail>(no email)</span>')+'</div><div class=vsub>'+(v.contact||'')+'</div>'+
       (problems.length?'<div class=warnmsg>\\u26A0 Active but can\\'t claim: '+problems.join('; ')+'</div>':'')+'</td>';
     columns.forEach(function(c){rows+='<td><input type=checkbox data-cap="'+c.tag+'" '+(caps.has(c.tag)?'checked':'')+'></td>';});
     rows+='<td><label class=switch><input type=checkbox class=active '+(v.active?'checked':'')+'><span class=slider></span></label></td>';
-    rows+='<td><input type=number class=max min=0 value="'+((v.maxConcurrent===0||v.maxConcurrent)?v.maxConcurrent:'')+'"></td></tr>';
+    rows+='<td><input type=number class=maxdig min=0 value="'+((v.maxDigitizing===0||v.maxDigitizing)?v.maxDigitizing:'')+'"></td>';
+    rows+='<td><input type=number class=maxother min=0 value="'+((v.maxOther===0||v.maxOther)?v.maxOther:'')+'"></td></tr>';
   });
   grid.innerHTML='<table>'+head+rows+'</table><div style=margin-top:14px><input id=newcap class=tagadd placeholder="add capability column"> <button class=addbtn onclick="addCol()">Add column</button> <span id=status class=saved></span></div>';
   grid.querySelector('table').addEventListener('change',function(e){const tr=e.target.closest('tr[data-i]');if(!tr)return;if(e.target.matches&&e.target.matches('input[type=checkbox][data-cap]'))enforceHierarchy(tr,e.target);saveRow(tr);});
@@ -1071,12 +1096,13 @@ async function saveRow(tr){
   const i=tr.getAttribute('data-i');const v=vendors[i];
   const capabilities=[].slice.call(tr.querySelectorAll('input[type=checkbox][data-cap]')).filter(function(c){return c.checked;}).map(function(c){return c.getAttribute('data-cap');});
   const active=tr.querySelector('.active').checked;
-  const maxv=tr.querySelector('.max').value;
+  const maxDigitizing=tr.querySelector('.maxdig').value;
+  const maxOther=tr.querySelector('.maxother').value;
   const status=document.getElementById('status');status.textContent='Saving\u2026';status.style.color='#64748b';
   try{
-    const r=await fetch('/vendor/api/admin/vendor-controls',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:v.id,capabilities:capabilities,maxConcurrent:maxv,active:active})});
+    const r=await fetch('/vendor/api/admin/vendor-controls',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:v.id,capabilities:capabilities,maxDigitizing:maxDigitizing,maxOther:maxOther,active:active})});
     const j=await r.json();
-    v.capabilities=capabilities;v.active=active;v.maxConcurrent=maxv;
+    v.capabilities=capabilities;v.active=active;v.maxDigitizing=maxDigitizing;v.maxOther=maxOther;
     status.textContent=j.ok?('Saved '+(v.email||'')+' \u2713'):('Error: '+(j.error||'failed'));
     status.style.color=j.ok?'#16a34a':'#dc2626';
   }catch(e){status.textContent='Error saving';status.style.color='#dc2626';}
@@ -1305,15 +1331,16 @@ function renderStats(){
 }
 function eligibleFor(o){
   var req=o.reqCaps||[];
+  var dig=(o.type==='Digitizing');
   return (DATA.artists||[]).filter(function(a){
     if(!a.active)return false;
     var caps=(a.capabilities||[]).map(function(c){return String(c).toLowerCase();});
     for(var i=0;i<req.length;i++){if(caps.indexOf(req[i])<0)return false;}
     return true;
   }).map(function(a){
-    var load=(a.ordersPending||0)+(a.editsPending||0);
-    var cap=(a.cap==null||a.cap==='')?null:Number(a.cap);
-    return {email:a.email,contact:a.contact,load:load,cap:cap,under:(cap==null||load<cap)};
+    var load=dig?(a.digLoad||0):(a.otherLoad||0);
+    var cap=dig?a.capDig:a.capOther;cap=(cap==null||cap==='')?null:Number(cap);
+    return {email:a.email,contact:a.contact,load:load,cap:cap,bucket:(dig?'digitizing':'other'),under:(cap!=null&&load<cap)};
   });
 }
 function vendList(arr){
@@ -1477,15 +1504,17 @@ async function load(){
 }
 function renderChips(){
   var av=(data.claimable||[]).filter(function(o){return !o.locked;}).length,ed=(data.edits||[]).length;
-  var slots=(data.openCount!=null?data.openCount:0)+' of '+(data.limit!=null?data.limit:0);
-  var full=!data.underLimit;
+  var dig=(data.digLoad!=null?data.digLoad:0)+'/'+(data.capDig!=null?data.capDig:0);
+  var oth=(data.otherLoad!=null?data.otherLoad:0)+'/'+(data.capOther!=null?data.capOther:0);
+  var digFull=!data.underDig,othFull=!data.underOther;
   var mt=(data.monthlyTimer!=null&&data.monthlyTimer!=='')?(data.monthlyTimer+'h'):'\\u2013';
   var met=(data.monthlyEditTimer!=null&&data.monthlyEditTimer!=='')?(data.monthlyEditTimer+'h'):'\\u2013';
   chips.innerHTML=
     (ed?'<span class="chip danger">'+ed+' edit'+(ed===1?'':'s')+'</span>':'')+
     (av?'<span class="chip info">'+av+' ready to claim</span>':'')+
     '<span class=chip title="Avg turnaround this month \\u2014 orders (claim\\u2192done) / edits">Month \\u23F1 '+esc(String(mt))+' ord / '+esc(String(met))+' edit</span>'+
-    '<span class="chip slots'+(full?' full':'')+'">'+slots+' slots</span>'+
+    '<span class="chip slots'+(digFull?' full':'')+'" title="Digitizing slots in use">Digitizing '+dig+'</span>'+
+    '<span class="chip slots'+(othFull?' full':'')+'" title="Vector + Digital slots in use">Other '+oth+'</span>'+
     '<button class=logout onclick=logout()>Log out</button>';
 }
 function renderList(){
@@ -1508,7 +1537,8 @@ function rowHtml(o,state){
         '<div class=rmain><div class=rtitle>Order '+esc(o.orderNo||o.id)+'</div><div class=rsub>Next in line \\u00b7 #'+(o.pos||'?')+' in the '+esc(o.type||'')+' queue</div></div>'+
         '<div class=rtype>'+esc(o.type||'')+'</div><div class=rright><span class=nextpill>Next in line</span></div></div>';
     }
-    var act=data.underLimit?'<button class=claim onclick="claim(\\''+o.id+'\\')">Claim</button>':'<span style=color:#94a3b8;font-size:13px>At limit</span>';
+    var canClaim=(o.type==='Digitizing')?data.underDig:data.underOther;
+    var act=canClaim?'<button class=claim onclick="claim(\\''+o.id+'\\')">Claim</button>':'<span style=color:#94a3b8;font-size:13px>At limit</span>';
     return '<div class="row av nopick"><div class="rthumb ph">\\u25A1</div>'+
       '<div class=rmain><div class=rtitle>Order '+esc(o.orderNo||o.id)+'<span class="mini m-new">Next up</span></div><div class=rsub>Oldest '+esc(o.type||'')+' \\u2014 ready to claim</div></div>'+
       '<div class=rtype>'+esc(o.type||'')+'</div><div class=rright>'+act+'</div></div>';
@@ -1622,7 +1652,7 @@ function timerClass(since){
 async function claim(id){
   const r=await fetch('/vendor/api/claim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({orderId:id})});
   const d=await r.json();
-  if(!d.ok){var m=d.reason==='claim_oldest_first'?'Please claim the oldest order in line first.':(d.reason==='at_limit_finish_open_work_first'?'You\\'re at your limit \\u2014 finish open work first.':(d.reason||d.error||'Could not claim'));alert(m);}
+  if(!d.ok){var m=d.reason==='claim_oldest_first'?'Please claim the oldest order in line first.':(d.reason==='at_digitizing_limit'?'You\\'re at your digitizing limit \\u2014 finish a digitizing job first.':(d.reason==='at_other_limit'?'You\\'re at your vector/digital limit \\u2014 finish one first.':(d.reason||d.error||'Could not claim')));alert(m);}
   panelOpenId=null;panel.classList.remove('open');backdrop.classList.remove('open');load();
 }
 async function submitPanel(id,emb){
@@ -1673,7 +1703,8 @@ input{padding:8px;border:1px solid #cbd5e1;border-radius:6px}.tag{font-size:12px
     <input id=nvName placeholder="Name">
     <input id=nvEmail placeholder="Email (required)">
     <input id=nvPhone placeholder="Phone (optional)">
-    <label class=tag>Max concurrent <input id=nvMax type=number min=0 value=3 style=width:60px></label>
+    <label class=tag>Max digitizing <input id=nvMaxDig type=number min=0 value=3 style=width:55px></label>
+    <label class=tag>Max other <input id=nvMaxOther type=number min=0 value=3 style=width:55px></label>
     <label class=tag><input type=checkbox id=nvActive checked> Active</label>
   </div>
   <div class=tag style="margin:12px 0 6px">Capabilities</div>
@@ -1713,7 +1744,8 @@ async function createVendor(){
   const body={
     email:email,contact:document.getElementById('nvName').value.trim(),
     phone:document.getElementById('nvPhone').value.trim(),
-    maxConcurrent:document.getElementById('nvMax').value,
+    maxDigitizing:document.getElementById('nvMaxDig').value,
+    maxOther:document.getElementById('nvMaxOther').value,
     active:document.getElementById('nvActive').checked,
     capabilities:capabilities,tempPassword:document.getElementById('nvPw').value.trim()
   };
