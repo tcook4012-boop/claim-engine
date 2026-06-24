@@ -45,10 +45,19 @@ const F = {
 // Artist type field names.
 const ART = {
   email:          "email",             // artist email field (confirmed: plain "email")
-  maxConcurrent:  "max_concurrent_orders",
+  maxConcurrent:  "max_concurrent_orders",     // "other" bucket (vector + digital)
+  maxDigitizing:  "max_concurrent_digitizing", // digitizing bucket
   isActive:       "is_active_vendor",
   capabilities:   "capabilities",
 };
+// Read a numeric field tolerantly across casing variants (Bubble API keys have bitten
+// us before, e.g. a capital-M label). Returns 0 if absent/blank.
+function readNum(a, ...keys) {
+  for (const k of keys) { const v = a[k]; if (v !== undefined && v !== null && v !== "") return Number(v) || 0; }
+  return 0;
+}
+// Which cap bucket an order/edit falls in: digitizing vs everything else.
+const bucketOf = (orderType) => (orderType === "Digitizing" ? "digitizing" : "other");
 const CS = { unclaimed: "unclaimed", claimed: "claimed", review: "needs_review", completed: "completed", edit: "edit_requested" };
 
 // use_new_system is a real yes/no field -> Bubble returns boolean true/false.
@@ -98,12 +107,17 @@ async function search(type, constraints) {
 async function artistByEmail(email) {
   const rows = await search("artist", [{ key: ART.email, constraint_type: "equals", value: email }]);
   const a = rows[0];
-  return a ? { email, maxConcurrent: Number(a[ART.maxConcurrent] || 0),
-              capabilities: a[ART.capabilities] || [] } : null;
+  if (!a) return null;
+  const capOther = readNum(a, "max_concurrent_orders", "Max_concurrent_orders");
+  const capDigitizing = readNum(a, "max_concurrent_digitizing", "Max_concurrent_digitizing");
+  return { email, capOther, capDigitizing, maxConcurrent: capOther + capDigitizing,
+           capabilities: a[ART.capabilities] || [] };
 }
 const activeVendors = () =>
   search("artist", [{ key: ART.isActive, constraint_type: "equals", value: YES }])
-    .then(rows => rows.map(a => ({ email: a[ART.email], maxConcurrent: Number(a[ART.maxConcurrent] || 0),
+    .then(rows => rows.map(a => ({ email: a[ART.email],
+                                   capOther: readNum(a, "max_concurrent_orders", "Max_concurrent_orders"),
+                                   capDigitizing: readNum(a, "max_concurrent_digitizing", "Max_concurrent_digitizing"),
                                    capabilities: a[ART.capabilities] || [] })));
 async function eligibleVendors(order) {
   const need = requiredCapsForOrder(order);
@@ -131,6 +145,22 @@ async function countClaimed(email) {
       { key: "Completed", constraint_type: "is_empty" }]);
   } catch (e) { console.warn("[countClaimed] edit_request count failed:", e.message); }
   return claimed.length + openEdits.length;
+}
+// Per-bucket load: claimed orders + open edits whose original order type falls in the
+// given bucket ("digitizing" vs "other"). Edits count against their order's bucket (a).
+async function countClaimedBucket(email, bucket) {
+  const claimed = await search("uploaded_image", [
+    { key: F.assignedArtist, constraint_type: "equals", value: email },
+    { key: F.claimState, constraint_type: "equals", value: CS.claimed }]);
+  let openEdits = [];
+  try {
+    openEdits = await search("edit_request", [
+      { key: "Assigned_Artist", constraint_type: "equals", value: email },
+      { key: "Completed", constraint_type: "is_empty" }]);
+  } catch (e) { console.warn("[countClaimedBucket] edit_request count failed:", e.message); }
+  const c = claimed.filter(o => bucketOf(o.Order_Type) === bucket).length;
+  const e = openEdits.filter(ed => bucketOf(ed.Order_Type) === bucket).length;
+  return c + e;
 }
 
 // ------------------------------ PER-ORDER LOCK -------------------------------
@@ -192,8 +222,10 @@ async function tryClaim(orderId, email) {
   const caps = (a.capabilities || []).map(x => String(x).toLowerCase());
   if (!need.every(c => caps.includes(c)))
     return { ok: false, reason: "not_eligible_for_this_work" };
-  if ((await countClaimed(email)) >= a.maxConcurrent)
-    return { ok: false, reason: "at_limit_finish_open_work_first" };
+  const bucket = bucketOf(o.Order_Type);
+  const bucketCap = bucket === "digitizing" ? a.capDigitizing : a.capOther;
+  if ((await countClaimedBucket(email, bucket)) >= bucketCap)
+    return { ok: false, reason: bucket === "digitizing" ? "at_digitizing_limit" : "at_other_limit" };
   // OLDEST-FIRST PER TYPE: block claiming if an older unclaimed order of the SAME type
   // that this vendor is ALSO eligible for is still waiting. Prevents cherry-picking
   // newer/easier orders ahead of the queue (enforced server-side, not just in the UI).
@@ -220,16 +252,20 @@ async function tryClaim(orderId, email) {
 async function forceAssign(orderId, email) {
   const a = await artistByEmail(email);
   if (!a) return { ok: false, reason: "no_artist_with_that_email" };
-  const open = await countClaimed(email);
+  const o = await getOrder(orderId);
+  const bucket = bucketOf(o.Order_Type);
+  const bucketCap = bucket === "digitizing" ? a.capDigitizing : a.capOther;
+  const open = await countClaimedBucket(email, bucket);
   await patchOrder(orderId, {
     [F.claimState]: CS.claimed,
     [F.assignedArtist]: email,
     [F.claimedAt]: Date.now(),
   });
-  console.log(`[force-assigned] order ${orderId} -> ${email} (now ${open + 1}/${a.maxConcurrent}${open + 1 > a.maxConcurrent ? ", OVER cap" : ""})`);
+  const over = open + 1 > bucketCap;
+  console.log(`[force-assigned] order ${orderId} -> ${email} (${bucket} now ${open + 1}/${bucketCap}${over ? ", OVER cap" : ""})`);
   await logEvent(orderId, email, "admin_force_assigned",
-    `admin push; vendor now ${open + 1}/${a.maxConcurrent}`);
-  return { ok: true, overCap: open + 1 > a.maxConcurrent };
+    `admin push; ${bucket} now ${open + 1}/${bucketCap}`);
+  return { ok: true, overCap: over };
 }
 
 async function escalate(id, why) {
