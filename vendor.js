@@ -959,6 +959,53 @@ function mountVendorPortal(app, deps) {
 
   // ---- TEMP DEBUG: raw record JSON (admin only) — REMOVE after field-name check.
   // /vendor/api/admin/raw?type=artist&id=<id>  (type defaults to uploaded_image)
+  // TEMP diagnostic: surfaces exactly why completion mail might not send.
+  //   /vendor/api/admin/email-test                       -> is the key present? what's the From?
+  //   /vendor/api/admin/email-test?to=you@example.com    -> actually send a test, report SendGrid status+body
+  //   /vendor/api/admin/email-test?orderNo=12345         -> resolve that order's client recipient (no send)
+  // Remove before launch alongside the raw route.
+  app.get("/vendor/api/admin/email-test", requireAdminLogin, async (req, res) => {
+    const out = { keyPresent: !!SENDGRID_KEY, from: MAIL_FROM_EMAIL, bcc: MAIL_BCC };
+    try {
+      const orderNo = String(req.query.orderNo || "").trim();
+      if (orderNo) {
+        const rows = await search("uploaded_image", [{ key: "Order#", constraint_type: "equals", value: orderNo }]);
+        const o = rows[0];
+        if (!o) { out.recipientLookup = "order not found"; return res.json(out); }
+        let to = (o.Email && String(o.Email).trim()) ? String(o.Email).trim() : "";
+        out.orderEmailField = o.Email || "(blank)";
+        if (!to && o.User) {
+          try {
+            const u = await bubble("GET", `/user/${o.User}`).then((r) => r.response);
+            to = u && u.authentication && u.authentication.email && u.authentication.email.email ? u.authentication.email.email : "";
+            out.resolvedFromUser = to || "(nested authentication.email.email was empty)";
+          } catch (e) { out.userLookupError = e.message; }
+        }
+        out.wouldSendTo = to || "(none — email would be skipped)";
+        return res.json(out);
+      }
+      const to = String(req.query.to || "").trim();
+      if (!to) { out.note = "Pass ?to=email to send a test, or ?orderNo=# to check recipient resolution."; return res.json(out); }
+      if (!SENDGRID_KEY) { out.result = "SENDGRID_API_KEY is not set on this service — that's why nothing sends."; return res.json(out); }
+      const payload = {
+        personalizations: [{ to: [{ email: to }] }],
+        from: { email: MAIL_FROM_EMAIL, name: MAIL_FROM_NAME },
+        subject: "PrintReadyArt email test",
+        content: [{ type: "text/plain", value: "This is a PrintReadyArt SendGrid test. If you received this, completion email is configured correctly." }],
+      };
+      const r = await fetch("https://api.sendgrid.com/v3/mail/send", {
+        method: "POST", headers: { Authorization: `Bearer ${SENDGRID_KEY}`, "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      out.sendGridStatus = r.status;
+      out.sendGridBody = await r.text();
+      out.interpretation = (r.status >= 200 && r.status < 300)
+        ? "Accepted by SendGrid. Check the inbox (and spam) for " + to + "."
+        : (r.status === 401 ? "401 = API key invalid or lacks Mail Send permission."
+          : (r.status === 403 ? "403 = sender identity not verified. Verify " + MAIL_FROM_EMAIL + " (or its domain) in SendGrid > Sender Authentication."
+            : "Non-2xx from SendGrid — see sendGridBody."));
+      return res.json(out);
+    } catch (e) { out.error = e.message; return res.status(500).json(out); }
+  });
+
   app.get("/vendor/api/admin/raw", requireAdminLogin, async (req, res) => {
     try {
       const type = String(req.query.type || "uploaded_image");
