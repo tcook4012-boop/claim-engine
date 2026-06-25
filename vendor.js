@@ -252,6 +252,7 @@ function mountVendorPortal(app, deps) {
     let orderSpeed = null, editSpeed = null, ordersMonth = 0, editsMonth = 0;
     try {
       const done = await search("uploaded_image", [
+        { key: "use_new_system", constraint_type: "equals", value: true },
         { key: F.assignedArtist, constraint_type: "equals", value: email },
         { key: F.claimState, constraint_type: "equals", value: "completed" },
         { key: "Modified Date", constraint_type: "greater than", value: monIso }]);
@@ -260,9 +261,15 @@ function mountVendorPortal(app, deps) {
       orderSpeed = n ? +(s / n).toFixed(1) : null;
     } catch (e) { console.warn("[orders] monthly order speed failed:", e.message); }
     try {
-      const em = await search("edit_request", [
+      let em = await search("edit_request", [
         { key: "Assigned_Artist", constraint_type: "equals", value: email },
         { key: "Completed", constraint_type: "greater than", value: monIso }]);
+      // Keep only edits on new-system orders (edit_request has no flag of its own).
+      const flags = await Promise.all(em.map(async (e) => {
+        try { const m = await search("uploaded_image", [{ key: "Order#", constraint_type: "equals", value: e["Order#"] }]); return !!(m[0] && m[0].use_new_system === true); }
+        catch (_) { return false; }
+      }));
+      em = em.filter((_, i) => flags[i]);
       editsMonth = em.length; let s = 0, n = 0;
       em.forEach((e) => { if (e["Created Date"] && e.Completed) { const h = (new Date(e.Completed).getTime() - new Date(e["Created Date"]).getTime()) / 3600000; if (h >= 0) { s += h; n++; } } });
       editSpeed = n ? +(s / n).toFixed(1) : null;
@@ -435,6 +442,7 @@ function mountVendorPortal(app, deps) {
       // match it -- not just orders pre-stamped to this vendor. We pull the whole
       // unclaimed pool and filter to the ones this vendor is eligible for.
       const pool = await search("uploaded_image", [
+        { key: F.useNewSystem, constraint_type: "equals", value: true },
         { key: F.claimState, constraint_type: "equals", value: CS.unclaimed }]);
       const claimable = pool.filter((o) => vendorCanDo(o, myCaps));
       // OLDEST-FIRST, PER TYPE: only the single oldest unclaimed order of each type is
@@ -469,6 +477,18 @@ function mountVendorPortal(app, deps) {
           { key: "Assigned_Artist", constraint_type: "equals", value: email },
           { key: "Completed", constraint_type: "is_empty" }]);
       } catch (e) { console.warn("[orders] edit_request lookup failed:", e.message); }
+      // Join each open edit to its order (uploaded_image) ONCE, then keep only edits whose
+      // order is in the new system. edit_request has no use_new_system flag of its own, so
+      // we must check the underlying order. This same lookup feeds the edit cards below.
+      const editPairs = await Promise.all(openEdits.map(async (er) => {
+        let order = null;
+        try {
+          const m = await search("uploaded_image", [{ key: "Order#", constraint_type: "equals", value: er["Order#"] }]);
+          order = m[0] || null;
+        } catch (e) { console.warn("[orders] order lookup failed for " + er["Order#"] + ":", e.message); }
+        return { er, order };
+      }));
+      const newSysEdits = editPairs.filter((p) => p.order && p.order.use_new_system === true);
       // Cap load = claimed work + open edits (matches the engine's countClaimed). Open
       // edits consume slots so a vendor can't take new work until edits are cleared.
       // Per-bucket load (a): digitizing vs other (vector+digital). Edits count against
@@ -478,24 +498,17 @@ function mountVendorPortal(app, deps) {
       const isDig = (t) => (t || "") === "Digitizing";
       const digClaimed = mine.filter((o) => isDig(o.Order_Type)).length;
       const otherClaimed = mine.length - digClaimed;
-      const digEdits = openEdits.filter((er) => isDig(er.Order_Type)).length;
-      const otherEdits = openEdits.length - digEdits;
-      const editCount = openEdits.length;
+      const digEdits = newSysEdits.filter((p) => isDig(p.er.Order_Type)).length;
+      const otherEdits = newSysEdits.length - digEdits;
+      const editCount = newSysEdits.length;
       const digLoad = digClaimed + digEdits;
       const otherLoad = otherClaimed + otherEdits;
       const load = mine.length + editCount;
       const underDig = digLoad < capDig;
       const underOther = otherLoad < capOther;
-      const editViews = await Promise.all(openEdits.map(async (er) => {
-        let order = null;
-        try {
-          const m = await search("uploaded_image", [{ key: "Order#", constraint_type: "equals", value: er["Order#"] }]);
-          order = m[0] || null;
-        } catch (e) { console.warn("[orders] order lookup failed for " + er["Order#"] + ":", e.message); }
-        const base = order
-          ? orderView(order, await teamDocs(order.Team_Name, teamCache))
-          : { id: null, ref: "", orderNo: er["Order#"] || "", type: er.Order_Type || "", thumb: "", files: [], separations: "no", rush: "no", specialInstructions: "" };
-        base.id = order ? order._id : null; // "Upload revised" must target the ORDER
+      const editViews = await Promise.all(newSysEdits.map(async ({ er, order }) => {
+        const base = orderView(order, await teamDocs(order.Team_Name, teamCache));
+        base.id = order._id; // "Upload revised" must target the ORDER
         base.edit = {
           reqId: er._id,
           changes: er.Changes_Needed || "",
@@ -786,12 +799,20 @@ function mountVendorPortal(app, deps) {
   // ---- ADMIN ORDERS DASHBOARD: all pending orders + push/reassign/cancel -----
   app.get("/vendor/api/admin/dashboard", requireAdminLogin, async (_req, res) => {
     try {
-      const [artists, pending, openEdits] = await Promise.all([
+      const [artists, pending, allOpenEdits] = await Promise.all([
         search("artist", []),
-        search("uploaded_image", [{ key: "Pending", constraint_type: "equals", value: true }]),
+        search("uploaded_image", [
+          { key: "use_new_system", constraint_type: "equals", value: true },
+          { key: "Pending", constraint_type: "equals", value: true }]),
         search("edit_request", [{ key: "Completed", constraint_type: "is_empty" }]),
       ]);
       const now = Date.now();
+      // edit_request has no use_new_system flag; keep only edits whose order is a new-system
+      // order. Edits reopen the order to Pending=true, so a new-system edit's order is always
+      // in the (use_new_system-gated) `pending` set above. This also keeps the "Edits pending"
+      // count consistent with the row badges, which only attach to orders shown in the list.
+      const pendingNos = new Set(pending.map((o) => String(o["Order#"] || "")));
+      const openEdits = allOpenEdits.filter((er) => pendingNos.has(String(er["Order#"] || "")));
       const editsByVendor = {};
       openEdits.forEach((e) => { const a = String(e.Assigned_Artist || "").toLowerCase(); if (a) editsByVendor[a] = (editsByVendor[a] || 0) + 1; });
       // Open edits keyed by Order# so we can badge the order rows and show edit details.
@@ -864,6 +885,7 @@ function mountVendorPortal(app, deps) {
       openEdits.forEach((e) => { const b = bucket(e.Assigned_Artist); if (!b) return; b.ep++; if ((e.Order_Type || "") === "Digitizing") b.digEp++; else b.otherEp++; });
       try {
         const done = await search("uploaded_image", [
+          { key: "use_new_system", constraint_type: "equals", value: true },
           { key: F.claimState, constraint_type: "equals", value: "completed" },
           { key: "Modified Date", constraint_type: "greater than", value: iso }]);
         totals.completedToday = done.length;
@@ -871,18 +893,35 @@ function mountVendorPortal(app, deps) {
       } catch (e) { console.warn("[dashboard] completedToday failed:", e.message); totals.completedToday = null; }
       try {
         const mo = await search("uploaded_image", [
+          { key: "use_new_system", constraint_type: "equals", value: true },
           { key: F.claimState, constraint_type: "equals", value: "completed" },
           { key: "Modified Date", constraint_type: "greater than", value: monIso }]);
         totals.completedMonth = mo.length;
         mo.forEach((o) => { const b = bucket(o[F.assignedArtist]); if (!b) return; b.om++; const h = orderSpeedH(o); if (h != null) { b.osM[0] += h; b.osM[1]++; } });
       } catch (e) { console.warn("[dashboard] completedMonth failed:", e.message); totals.completedMonth = null; }
+      // Completed-edit metrics are on orders that are no longer pending, so the pending-set
+      // trick doesn't apply -- look each edit's order up (cached, and seeded with the
+      // already-known new-system pending orders) and keep only new-system ones.
+      const nsCache = new Map();
+      pendingNos.forEach((no) => nsCache.set(no, true));
+      const isNewSysOrder = async (no) => {
+        no = String(no || ""); if (!no) return false;
+        if (nsCache.has(no)) return nsCache.get(no);
+        let v = false;
+        try { const m = await search("uploaded_image", [{ key: "Order#", constraint_type: "equals", value: no }]); v = !!(m[0] && m[0].use_new_system === true); }
+        catch (e) { console.warn("[dashboard] new-system lookup failed for " + no + ":", e.message); }
+        nsCache.set(no, v); return v;
+      };
+      const gateEdits = async (eds) => { const f = await Promise.all(eds.map((e) => isNewSysOrder(e["Order#"]))); return eds.filter((_, i) => f[i]); };
       try {
-        const et = await search("edit_request", [{ key: "Completed", constraint_type: "greater than", value: iso }]);
+        let et = await search("edit_request", [{ key: "Completed", constraint_type: "greater than", value: iso }]);
+        et = await gateEdits(et);
         totals.editsToday = et.length;
         et.forEach((e) => { const b = bucket(e.Assigned_Artist); if (b) b.et++; });
       } catch (e) { console.warn("[dashboard] editsToday failed:", e.message); totals.editsToday = null; }
       try {
-        const em = await search("edit_request", [{ key: "Completed", constraint_type: "greater than", value: monIso }]);
+        let em = await search("edit_request", [{ key: "Completed", constraint_type: "greater than", value: monIso }]);
+        em = await gateEdits(em);
         totals.editsMonth = em.length;
         em.forEach((e) => { const b = bucket(e.Assigned_Artist); if (!b) return; b.em++; const h = editSpeedH(e); if (h != null) { b.esM[0] += h; b.esM[1]++; } });
       } catch (e) { console.warn("[dashboard] editsMonth failed:", e.message); totals.editsMonth = null; }
