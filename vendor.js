@@ -614,9 +614,11 @@ function mountVendorPortal(app, deps) {
       };
 
       if (isEmbroidery) {
-        patch.Height = Number(height);
-        patch.Width = Number(width);
-        patch.Stitch_Count = Number(stitch);
+        // Bubble's Height/Width/Stitch_Count are TEXT fields (the read side falls back to
+        // ""), so send the trimmed strings as-is rather than coercing to Number.
+        patch.Height = height;
+        patch.Width = width;
+        patch.Stitch_Count = stitch;
       }
 
       // Preview -> single `image` field (base64 object on a single field works).
