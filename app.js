@@ -49,7 +49,12 @@ const ART = {
   maxDigitizing:  "max_concurrent_digitizing", // digitizing bucket
   isActive:       "is_active_vendor",
   capabilities:   "capabilities",
+  idleThreshold:  "idle_threshold_hours",       // per-vendor override (blank = global default)
+  lastAction:     "last_action_at",             // any deliberate action (claim/upload/message/login)
+  lastUpload:     "last_upload_at",             // completed-order upload only
 };
+// Global fallback idle threshold (hours) when a vendor has no per-vendor override.
+const IDLE_DEFAULT_HOURS = Number(process.env.IDLE_DEFAULT_HOURS || 5);
 // Read a numeric field tolerantly across casing variants (Bubble API keys have bitten
 // us before, e.g. a capital-M label). Returns 0 if absent/blank.
 function readNum(a, ...keys) {
@@ -367,7 +372,57 @@ async function sweep() {
     //    No rotation, no per-vendor window -- nothing to do but count them.
     const open = await search("uploaded_image", [{ key: F.claimState, constraint_type: "equals", value: CS.unclaimed }]);
     if (fresh.length || open.length) console.log(`[sweep] ${fresh.length} new -> pool, ${open.length} waiting in pool`);
+    // 3) Idle reassignment: a claimed order held by a vendor who has gone quiet past
+    //    their idle threshold returns to the shared pool for an ACTIVE vendor. Edits are
+    //    never touched (they stay with the original artist unless an admin reassigns).
+    await reassignIdle();
   } catch (e) { console.error("[sweep error]", e.message); }
+}
+
+// Per-vendor idle threshold in ms: their own idle_threshold_hours, else the global default.
+function idleMsFor(artist) {
+  const h = readNum(artist, "idle_threshold_hours", "Idle_threshold_hours");
+  return (h > 0 ? h : IDLE_DEFAULT_HOURS) * 3600000;
+}
+// Is this vendor idle right now? A vendor who has NEVER acted (no last_action_at yet) is
+// treated as NOT idle -- otherwise every claimed order would be yanked the moment this
+// ships, before anyone has had a chance to act once.
+function vendorIsIdle(artist, now) {
+  const last = artist[ART.lastAction] || artist.Last_action_at || null;
+  if (!last) return false;
+  const t = new Date(last).getTime();
+  if (isNaN(t)) return false;
+  return now - t > idleMsFor(artist);
+}
+
+async function reassignIdle() {
+  const now = Date.now();
+  // Build an email -> artist map once, so we can look up each order-holder's threshold.
+  const artists = await search("artist", []);
+  const byEmail = {};
+  artists.forEach(a => { const e = String(a[ART.email] || "").toLowerCase(); if (e) byEmail[e] = a; });
+
+  const claimed = await search("uploaded_image", [{ key: F.claimState, constraint_type: "equals", value: CS.claimed }]);
+  let moved = 0;
+  for (const o of claimed) {
+    const holder = String(o[F.assignedArtist] || "").toLowerCase();
+    if (!holder) continue;
+    const a = byEmail[holder];
+    if (!a) continue;                         // holder not found -> leave it for admin
+    if (!vendorIsIdle(a, now)) continue;      // still active (or never acted) -> keep
+    // Uploading is itself a deliberate action that resets last_action_at, so a vendor
+    // mid-work can't be idle -- no extra "mid-upload" guard needed.
+    await withLock(o._id, async () => {
+      // Re-read under lock: a vendor may have just claimed/acted in the same tick.
+      const fresh = await getOrder(o._id);
+      if ((fresh[F.claimState] || "") !== CS.claimed) return;
+      if (String(fresh[F.assignedArtist] || "").toLowerCase() !== holder) return;
+      await startClock(o._id);                // back to the shared pool, re-notifies active vendors
+      await logEvent(o._id, holder, "idle_reassigned", `held by idle vendor ${holder}; returned to pool`);
+    });
+    moved++;
+  }
+  if (moved) console.log(`[idle] ${moved} order(s) from idle vendors returned to the pool`);
 }
 
 // -------------------------------- HTTP / PAGE --------------------------------
