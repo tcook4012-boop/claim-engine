@@ -54,6 +54,33 @@ function vendorCanDo(order, caps) {
   const have = (caps || []).map((c) => String(c).toLowerCase());
   return need.every((c) => have.includes(c));
 }
+/* ---- Write-once completion timestamps ---------------------------------------
+   "Modified Date" is a BAD completion proxy: an order finished in 8h that gets an
+   edit 3 days later reads as a 3-day order, because any later touch moves Modified
+   Date. So the engine stamps two timestamps that are written EXACTLY ONCE and never
+   moved: first_claimed_at and first_completed_at. Order speed = the gap between them.
+   (Edit speed was always fine -- edit_request carries real Created Date / Completed.)
+
+   Read tolerantly across casing variants: Bubble editor labels != Data API keys, and
+   that has bitten us on image, Client_Special_Instructions and max_concurrent_orders. */
+const FIRST_COMPLETED_KEYS = ["first_completed_at", "First_completed_at"];
+const FIRST_CLAIMED_KEYS = ["first_claimed_at", "First_claimed_at"];
+const readStamp = (o, keys) => { for (const k of keys) { if (o && o[k]) return o[k]; } return null; };
+const firstCompletedOf = (o) => readStamp(o, FIRST_COMPLETED_KEYS);
+// claimed_at is a legacy fallback ONLY: forceAssign re-stamps it on reassignment, so
+// it can drift after first completion. first_claimed_at never does.
+const firstClaimedOf = (o) => readStamp(o, FIRST_CLAIMED_KEYS) || (o && o.claimed_at) || null;
+// Hours from first claim to first completion. Null (not zero, not a guess) when either
+// stamp is missing -- orders completed before these fields existed are EXCLUDED from
+// averages rather than measured with a poisoned value.
+const orderSpeedHours = (o) => {
+  const fc = firstCompletedOf(o), st = firstClaimedOf(o);
+  if (!fc || !st) return null;
+  const h = (new Date(fc).getTime() - new Date(st).getTime()) / 3600000;
+  return h >= 0 ? h : null;
+};
+const completedAtMs = (o) => { const fc = firstCompletedOf(o); return fc ? new Date(fc).getTime() : null; };
+
 function newSession(data) {
   const token = makeToken();
   sessions.set(token, { ...data, created: Date.now() });
@@ -251,13 +278,18 @@ function mountVendorPortal(app, deps) {
     const monIso = monStart.toISOString();
     let orderSpeed = null, editSpeed = null, ordersMonth = 0, editsMonth = 0;
     try {
+      // Modified Date is a COARSE prefilter only -- it is always >= first_completed_at,
+      // so this search is a superset. We never query on the new field (a wrong API key
+      // would 400 the search); precision happens in code below.
       const done = await search("uploaded_image", [
         { key: "use_new_system", constraint_type: "equals", value: true },
         { key: F.assignedArtist, constraint_type: "equals", value: email },
         { key: F.claimState, constraint_type: "equals", value: "completed" },
         { key: "Modified Date", constraint_type: "greater than", value: monIso }]);
-      ordersMonth = done.length; let s = 0, n = 0;
-      done.forEach((o) => { if (o.claimed_at && o["Modified Date"]) { const h = (new Date(o["Modified Date"]).getTime() - new Date(o.claimed_at).getTime()) / 3600000; if (h >= 0) { s += h; n++; } } });
+      const monStartMs = monStart.getTime();
+      const doneThisMonth = done.filter((o) => { const ms = completedAtMs(o); return ms != null && ms >= monStartMs; });
+      ordersMonth = doneThisMonth.length; let s = 0, n = 0;
+      doneThisMonth.forEach((o) => { const h = orderSpeedHours(o); if (h != null) { s += h; n++; } });
       orderSpeed = n ? +(s / n).toFixed(1) : null;
     } catch (e) { console.warn("[orders] monthly order speed failed:", e.message); }
     try {
@@ -584,6 +616,83 @@ function mountVendorPortal(app, deps) {
     { name: "supporting", maxCount: 20 },
   ]);
 
+  // Email the job's working instructions to the vendor themselves.
+  // PRIVACY: the vendor portal deliberately carries ZERO client identity (no User id,
+  // client email/name, team name, or Customer_PO#). This email must not reintroduce that
+  // leak, so it is built field-by-field from work content only -- never from the raw order.
+  // Files are sent as LINKS, not attachments (Bubble URLs work in mail; attachments would
+  // mean base64 through SendGrid's ~30MB ceiling).
+  app.post("/vendor/api/email-instructions", express.json(), requireVendor, async (req, res) => {
+    try {
+      const email = effectiveEmail(req.session);
+      const orderId = String(req.body.orderId || "");
+      const o = await getOrder(orderId);
+      if (!o) return res.status(404).json({ ok: false, error: "Order not found" });
+      if (o[F.assignedArtist] !== email) return res.status(403).json({ ok: false, error: "Not your order" });
+
+      // Allowed for claimed work or an open edit on this order (same rule as upload).
+      let openEditReqs = [];
+      try {
+        openEditReqs = await search("edit_request", [
+          { key: "Order#", constraint_type: "equals", value: o["Order#"] },
+          { key: "Completed", constraint_type: "is_empty" }]);
+      } catch (e) { console.warn("[instructions] edit lookup failed:", e.message); }
+      if (o[F.claimState] !== CS.claimed && !openEditReqs.length)
+        return res.status(400).json({ ok: false, error: "Order is not in your list" });
+
+      const orderNo = o["Order#"] || orderId;
+      const team = await teamDocs(o.Team_Name, null);
+      const isDig = (o.Order_Type || "") === "Digitizing";
+      const extra = isDig ? await newOrdersDetail(orderNo) : null;
+
+      const L = [];
+      L.push(`Order #${orderNo}`);
+      L.push(`Type: ${o.Order_Type || "(none)"}`);
+      if (o.Rush === "yes") L.push("RUSH");
+      if ((o[F.separations] || "no") === "yes") L.push("Separations: yes");
+      if (o.OFM === "yes") L.push("OFM: yes");
+      if (o.PXF === "PXF") L.push("PXF: yes");
+      L.push("");
+
+      const spec = [];
+      const addSpec = (k, v) => { if (v !== undefined && v !== null && String(v).trim() !== "") spec.push(`  ${k}: ${v}`); };
+      addSpec("Height", o.Height); addSpec("Width", o.Width);
+      addSpec("Units", o["cm/in"]); addSpec("Stitch count", o.Stitch_Count);
+      addSpec("Number of logos", o.Unit);
+      addSpec("Art size", o.ArtDims_Seps); addSpec("Film size", o.FilmSizeSeps);
+      addSpec("Art placement", o.ArtPlacement_Seps);
+      if (extra) { addSpec("Placement", extra.placement); addSpec("3D puff", extra.puff); addSpec("Fabric", extra.fabric); }
+      if (spec.length) { L.push("SPECS"); L.push(...spec); L.push(""); }
+
+      if (o.Special_Instructions) { L.push("SPECIAL INSTRUCTIONS"); L.push(`  ${o.Special_Instructions}`); L.push(""); }
+
+      if (openEditReqs.length) {
+        L.push("EDIT REQUESTED");
+        for (const er of openEditReqs) {
+          if (er.Changes_Needed) L.push(`  Changes: ${er.Changes_Needed}`);
+          if (er.Edit_Reason) L.push(`  Reason: ${er.Edit_Reason}`);
+        }
+        L.push("");
+      }
+
+      const teamInstr = isDig ? team.digInstr : team.sepInstr;
+      if (teamInstr) { L.push("TEAM INSTRUCTIONS"); L.push(`  ${teamInstr}`); L.push(""); }
+
+      const links = fileLinks(o);
+      if (links.length) { L.push("FILES"); links.forEach((f) => L.push(`  ${f.label}: ${f.url}`)); L.push(""); }
+
+      const tmpl = isDig ? team.digTemplates : team.sepTemplates;
+      if (tmpl && tmpl.length) { L.push("TEMPLATES"); tmpl.forEach((t) => L.push(`  ${t.label || "Template"}: ${t.url}`)); L.push(""); }
+
+      L.push("Links open the files directly. Do not reply to this email --");
+      L.push("use the message thread on the order in the portal.");
+
+      await sendMail({ to: email, subject: `PrintReadyArt Order #${orderNo} - job instructions`, text: L.join("\n") });
+      console.log(`[instructions] order ${orderNo} emailed to ${email}`);
+      res.json({ ok: true, sentTo: email });
+    } catch (e) { console.error("[instructions]", e.message); res.status(500).json({ ok: false, error: e.message }); }
+  });
+
   app.post("/vendor/api/upload", requireVendor, completedUpload, async (req, res) => {
     try {
       const email = effectiveEmail(req.session);
@@ -652,6 +761,17 @@ function mountVendorPortal(app, deps) {
       // Final atomic completion write. Note: on an edit this also flips Edit_Requested
       // back to false (in patch above) and writes the revised files onto the order.
       await patchOrder(orderId, patch);
+
+      // WRITE-ONCE first-completion stamp. Two guards, both needed:
+      //   !isEditSubmit  -- an edit re-upload must never move the original completion time
+      //   !firstCompletedOf(o) -- nor may a plain re-upload before any edit exists
+      // Deliberately a SEPARATE, guarded write (like the message_sent flag below): Bubble
+      // rejects an entire PATCH on an unknown field key, and a metrics field must never be
+      // able to fail the completion it is measuring.
+      if (!isEditSubmit && !firstCompletedOf(o)) {
+        try { await patchOrder(orderId, { first_completed_at: Date.now() }); }
+        catch (e) { console.warn("[stamp] first_completed_at write failed:", e.message); }
+      }
 
       // Edit submit: stamp the open Edit_Request record(s) Completed = now so they drop
       // out of the vendor's edit queue into history. Best-effort: a failure here doesn't
@@ -879,25 +999,32 @@ function mountVendorPortal(app, deps) {
         if (!byV[email]) byV[email] = { op: 0, ag: 0, ep: 0, ot: 0, om: 0, et: 0, em: 0, osT: [0, 0], osM: [0, 0], esM: [0, 0], digOp: 0, otherOp: 0, digEp: 0, otherEp: 0 };
         return byV[email];
       };
-      const orderSpeedH = (o) => { if (!o.claimed_at || !o["Modified Date"]) return null; const h = (new Date(o["Modified Date"]).getTime() - new Date(o.claimed_at).getTime()) / 3600000; return h >= 0 ? h : null; };
+      const orderSpeedH = orderSpeedHours; // write-once stamps; see module-level helpers
       const editSpeedH = (e) => { if (!e["Created Date"] || !e.Completed) return null; const h = (new Date(e.Completed).getTime() - new Date(e["Created Date"]).getTime()) / 3600000; return h >= 0 ? h : null; };
+      const dayStartMs = dayStart.getTime(), monStartMs = monStart.getTime();
       pending.forEach((o) => { if (!isClaimed(o)) return; const b = bucket(o[F.assignedArtist]); if (!b) return; b.op++; if ((o.Order_Type || "") === "Digitizing") b.digOp++; else b.otherOp++; const h = hSinceClaim(o); if (h != null && h > 14) b.ag++; });
       openEdits.forEach((e) => { const b = bucket(e.Assigned_Artist); if (!b) return; b.ep++; if ((e.Order_Type || "") === "Digitizing") b.digEp++; else b.otherEp++; });
+      // "Done today/month" counts REAL first-completions. Searching on Modified Date alone
+      // double-counted: an order completed days ago whose edit lands today still matches
+      // claim_state=completed + modified-today. Modified Date stays as a coarse prefilter
+      // (always >= first_completed_at); first_completed_at decides membership.
       try {
         const done = await search("uploaded_image", [
           { key: "use_new_system", constraint_type: "equals", value: true },
           { key: F.claimState, constraint_type: "equals", value: "completed" },
           { key: "Modified Date", constraint_type: "greater than", value: iso }]);
-        totals.completedToday = done.length;
-        done.forEach((o) => { const b = bucket(o[F.assignedArtist]); if (!b) return; b.ot++; const h = orderSpeedH(o); if (h != null) { b.osT[0] += h; b.osT[1]++; } });
+        const doneToday = done.filter((o) => { const ms = completedAtMs(o); return ms != null && ms >= dayStartMs; });
+        totals.completedToday = doneToday.length;
+        doneToday.forEach((o) => { const b = bucket(o[F.assignedArtist]); if (!b) return; b.ot++; const h = orderSpeedH(o); if (h != null) { b.osT[0] += h; b.osT[1]++; } });
       } catch (e) { console.warn("[dashboard] completedToday failed:", e.message); totals.completedToday = null; }
       try {
         const mo = await search("uploaded_image", [
           { key: "use_new_system", constraint_type: "equals", value: true },
           { key: F.claimState, constraint_type: "equals", value: "completed" },
           { key: "Modified Date", constraint_type: "greater than", value: monIso }]);
-        totals.completedMonth = mo.length;
-        mo.forEach((o) => { const b = bucket(o[F.assignedArtist]); if (!b) return; b.om++; const h = orderSpeedH(o); if (h != null) { b.osM[0] += h; b.osM[1]++; } });
+        const doneMonth = mo.filter((o) => { const ms = completedAtMs(o); return ms != null && ms >= monStartMs; });
+        totals.completedMonth = doneMonth.length;
+        doneMonth.forEach((o) => { const b = bucket(o[F.assignedArtist]); if (!b) return; b.om++; const h = orderSpeedH(o); if (h != null) { b.osM[0] += h; b.osM[1]++; } });
       } catch (e) { console.warn("[dashboard] completedMonth failed:", e.message); totals.completedMonth = null; }
       // Completed-edit metrics are on orders that are no longer pending, so the pending-set
       // trick doesn't apply -- look each edit's order up (cached, and seeded with the
@@ -1595,6 +1722,16 @@ main{max-width:880px;margin:18px auto;padding:0 16px}
 .tmpl .link{background:#dbeafe;color:#1e40af}
 .editbox{margin-top:12px;padding:12px;background:#fef2f2;border:1px solid #fecaca;border-radius:8px}.editbox .link{background:#fee2e2;color:#991b1b}
 .multibanner{display:flex;align-items:center;gap:8px;background:#fee2e2;color:#991b1b;border-radius:8px;padding:9px 12px;font-size:13px;font-weight:700;margin-bottom:12px}
+.limbar{background:#fff;border:1px solid #e6ebf1;border-radius:12px;padding:12px 16px;margin-bottom:16px}
+.limbar.allfull{border-color:#fecaca;background:#fff7f7}
+.limline{font-size:14px;color:#0f172a}
+.limnote{font-size:12.5px;color:#64748b;margin-top:4px}
+.limmax{margin-top:10px;background:#fff7ed;border:1px solid #fed7aa;color:#9a3412;border-radius:8px;padding:9px 12px;font-size:13px;font-weight:600}
+.mailme{display:flex;align-items:center;gap:10px;margin:14px 0 4px;flex-wrap:wrap}
+.mailbtn{background:#f1f5f9;color:#334155;border:1px solid #dbe3ea;border-radius:8px;padding:8px 13px;font-size:13px;font-weight:600;cursor:pointer}
+.mailbtn:hover{background:#e9eef4}
+.mailbtn:disabled{opacity:.6;cursor:default}
+.mailmsg{font-size:12.5px;font-weight:600}
 .uploadwrap{margin-top:16px;border-top:1px solid #eef2f6;padding-top:14px}
 .uploadwrap .tag{font-size:12px;color:#64748b;display:block;margin-top:10px;margin-bottom:3px}
 .msgwrap{margin-top:16px;border-top:1px solid #eef2f6;padding-top:14px}
@@ -1644,7 +1781,7 @@ function renderChips(){
     (av?'<span class="chip info">'+av+' ready to claim</span>':'')+
     '<span class=chip title="Avg turnaround this month \\u2014 orders (claim\\u2192done) / edits">Month \\u23F1 '+esc(String(mt))+' ord / '+esc(String(met))+' edit</span>'+
     '<span class="chip slots'+(digFull?' full':'')+'" title="Digitizing slots in use">Digitizing '+dig+'</span>'+
-    '<span class="chip slots'+(othFull?' full':'')+'" title="Vector + Digital slots in use">Other '+oth+'</span>'+
+    '<span class="chip slots'+(othFull?' full':'')+'" title="Vector + Digital (DTF/DTG) slots in use">Vector + DTF '+oth+'</span>'+
     '<button class=logout onclick=logout()>Log out</button>';
 }
 function renderList(){
@@ -1652,7 +1789,26 @@ function renderList(){
   pr.sort(function(a,b){return new Date(a.claimedAt||0)-new Date(b.claimedAt||0);});
   ed.sort(function(a,b){var m=(b.multiEdit?1:0)-(a.multiEdit?1:0);if(m)return m;return new Date((a.edit&&a.edit.created)||0)-new Date((b.edit&&b.edit.created)||0);});
   var html=groupHtml('Edit requests',ed,'edit')+groupHtml('Available to claim',av,'available')+groupHtml('In progress',pr,'progress');
-  main.innerHTML=html||'<div class=muted>Nothing in your queue right now.</div>';
+  main.innerHTML=limitsBarHtml()+(html||'<div class=muted>Nothing in your queue right now.</div>');
+}
+// Limits + maxed-out messaging. Deliberately BUCKET-AWARE: with two independent caps a
+// vendor can be full on digitizing and wide open on vector/DTF, so a blanket
+// "you are maxed out" would be wrong half the time and would suppress claims we want.
+function limitsBarHtml(){
+  var dl=data.digLoad!=null?data.digLoad:0,dc=data.capDig!=null?data.capDig:0;
+  var ol=data.otherLoad!=null?data.otherLoad:0,oc=data.capOther!=null?data.capOther:0;
+  var digFull=!data.underDig,othFull=!data.underOther;
+  var line='<div class=limline><b>Your limits</b> \\u00b7 Digitizing '+dl+'/'+dc+' \\u00b7 Vector + DTF '+ol+'/'+oc+'</div>';
+  var note='<div class=limnote>We actively monitor turn time and edit request % to increase the number of jobs you can claim.</div>';
+  var callout='';
+  if(digFull&&othFull){
+    callout='<div class=limmax>\\u26D4 You\\'re at both limits. Complete an order to free up a slot.</div>';
+  }else if(digFull){
+    callout='<div class=limmax>\\u26D4 You\\'re at your digitizing limit ('+dl+'/'+dc+'). Complete a digitizing job to claim another.'+(oc>0?' You still have '+(oc-ol)+' Vector + DTF slot'+((oc-ol)===1?'':'s')+' open.':'')+'</div>';
+  }else if(othFull){
+    callout='<div class=limmax>\\u26D4 You\\'re at your Vector + DTF limit ('+ol+'/'+oc+'). Complete one to claim another.'+(dc>0?' You still have '+(dc-dl)+' Digitizing slot'+((dc-dl)===1?'':'s')+' open.':'')+'</div>';
+  }
+  return '<div class="limbar'+((digFull&&othFull)?' allfull':'')+'">'+line+note+callout+'</div>';
 }
 function groupHtml(label,arr,state){
   if(!arr.length)return '';
@@ -1739,8 +1895,21 @@ function fillPanel(o){
   var thumb=o.thumb?'<img class=pthumb src="'+o.thumb+'" onclick="window.open(\\''+o.thumb+'\\',\\'_blank\\')" onerror="this.style.display=\\'none\\'">':'';
   var notes=o.specialInstructions?'<div class=notes><b>Special instructions:</b> '+esc(o.specialInstructions)+'</div>':'';
   var action=(state==='available')?'<div class=paction><button class=upload style=background:#16a34a onclick="claim(\\''+o.id+'\\')">Claim this order</button></div>':uploadFormHtml(o,state==='edit');
+  var mailMe=(state==='available')?'':'<div class=mailme><button id=mailBtn class=mailbtn onclick="emailInstructions(\\''+o.id+'\\')">\\u2709 Email me these instructions</button><span id=mailMsg class=mailmsg></span></div>';
   panel.innerHTML='<div class=phead><div><div class=ptitle>Order '+esc(o.orderNo||'')+'</div><div class=peyebrow>'+esc(o.type||'')+'</div></div><div style=display:flex;gap:8px;align-items:center>'+pill+'<button class=pclose onclick="closeDetail()">\\u2715</button></div></div>'+
-    '<div class=pbody>'+multi+'<div>'+badges+'</div>'+thumb+(state==='edit'?editBlockHtml(o):'')+notes+specBlockHtml(o)+tmplBlockHtml(o)+filesBlockHtml(o,state)+action+(state!=='available'?msgBlockHtml(o):'')+'</div>';
+    '<div class=pbody>'+multi+'<div>'+badges+'</div>'+thumb+(state==='edit'?editBlockHtml(o):'')+notes+specBlockHtml(o)+tmplBlockHtml(o)+filesBlockHtml(o,state)+mailMe+action+(state!=='available'?msgBlockHtml(o):'')+'</div>';
+}
+async function emailInstructions(id){
+  var b=document.getElementById('mailBtn'),m=document.getElementById('mailMsg');
+  if(!b)return;
+  b.disabled=true;var old=b.textContent;b.textContent='Sending\\u2026';m.textContent='';
+  try{
+    const r=await fetch('/vendor/api/email-instructions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({orderId:id})});
+    const d=await r.json();
+    if(d.ok){b.textContent=old;m.style.color='#16a34a';m.textContent='Sent to '+d.sentTo;}
+    else{b.textContent=old;m.style.color='#dc2626';m.textContent=d.error||'Could not send';}
+  }catch(e){b.textContent=old;m.style.color='#dc2626';m.textContent='Could not send';}
+  b.disabled=false;
 }
 function msgBlockHtml(o){
   return '<div class=msgwrap><div class=tmpl-label>Messages with PrintReadyArt</div>'+
