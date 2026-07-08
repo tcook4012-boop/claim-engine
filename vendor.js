@@ -81,6 +81,67 @@ const orderSpeedHours = (o) => {
 };
 const completedAtMs = (o) => { const fc = firstCompletedOf(o); return fc ? new Date(fc).getTime() : null; };
 
+/* ---- Edit fault classification (minimal) ------------------------------------
+   An edit is either OUR mistake (vendor_error) or the client wanting something
+   different (client_change), or unclear. Claude labels every new edit automatically;
+   the label is the number. A human can override, which LOCKS the row so the
+   classifier never touches it again.
+
+   Config (model, confidence floor, the prompt itself) lives in ./fault-prompt.js --
+   the one file you edit to tune this. Kept OUT of the database on purpose.
+
+   Only TWO fields are stored per edit:
+     edit_fault    (text)   vendor_error | client_change | unclear
+     fault_locked  (yes/no) a human set it; the classifier must not overwrite. */
+const { FAULT_MODEL, FAULT_CONFIDENCE_FLOOR, FAULT_CODES, FAULT_PROMPT } = require("./fault-prompt");
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || "";
+const AUTO_CLASSIFY_MIN = Number(process.env.FAULT_AUTO_CLASSIFY_MIN || 30); // background sweep cadence
+const SWEEP_BATCH = Math.min(Math.max(Number(process.env.FAULT_SWEEP_BATCH || 25), 1), 100);
+/* FORWARD-ONLY. Without a cutoff the sweep would grind through the entire back
+   catalogue. Pin FAULT_START_DATE (e.g. 2026-07-08) so the boundary survives redeploys;
+   otherwise it falls back to boot time. */
+const FAULT_START_ISO = (() => {
+  const raw = process.env.FAULT_START_DATE;
+  if (raw) { const d = new Date(raw); if (!isNaN(d)) return d.toISOString();
+    console.warn(`[fault] FAULT_START_DATE="${raw}" invalid -- using boot time`); }
+  else console.warn("[fault] FAULT_START_DATE not set -- classifying edits after THIS BOOT. Pin it to survive redeploys.");
+  return new Date().toISOString();
+})();
+
+// Read tolerantly (Bubble editor labels != API keys) and normalize.
+const readField = (r, ...keys) => { for (const k of keys) { const v = r && r[k]; if (v !== undefined && v !== null && v !== "") return v; } return null; };
+const normFault = (v) => { const f = String(v || "").toLowerCase().trim(); return FAULT_CODES.includes(f) ? f : null; };
+const faultOf = (er) => normFault(readField(er, "edit_fault", "Edit_Fault"));
+const isLocked = (er) => { const v = readField(er, "fault_locked", "Fault_Locked"); return v === true || v === "yes" || v === "true"; };
+
+/* Ask Claude to label one edit. Returns {ok,fault} and never throws into the caller. */
+async function classifyEditFault(er, order) {
+  if (!ANTHROPIC_KEY) return { ok: false, error: "ANTHROPIC_API_KEY not set" };
+  const payload = {
+    ORDER_TYPE: (order && order.Order_Type) || er.Order_Type || "",
+    ORIGINAL_INSTRUCTIONS: (order && order.Special_Instructions) || "",
+    CHANGES_REQUESTED: er.Changes_Needed || "",
+    CLIENT_SELECTED_REASON: er.Edit_Reason || "",
+  };
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+      body: JSON.stringify({ model: FAULT_MODEL, max_tokens: 150, system: FAULT_PROMPT, messages: [{ role: "user", content: JSON.stringify(payload) }] }),
+    });
+    if (!res.ok) return { ok: false, error: `Claude ${res.status}: ${(await res.text()).slice(0, 160)}` };
+    const data = await res.json();
+    const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("").trim();
+    const clean = text.replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+    let parsed; try { parsed = JSON.parse(clean); } catch (_) { return { ok: false, error: "bad JSON: " + clean.slice(0, 100) }; }
+    const fault = normFault(parsed.fault);
+    if (!fault) return { ok: false, error: "unknown fault code" };
+    let conf = Number(parsed.confidence); if (!(conf >= 0 && conf <= 1)) conf = 0;
+    // Below the floor, don't guess -- store "unclear" so a vendor is never blamed on a shaky call.
+    return { ok: true, fault: conf >= FAULT_CONFIDENCE_FLOOR ? fault : "unclear" };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
 function newSession(data) {
   const token = makeToken();
   sessions.set(token, { ...data, created: Date.now() });
@@ -306,7 +367,32 @@ function mountVendorPortal(app, deps) {
       em.forEach((e) => { if (e["Created Date"] && e.Completed) { const h = (new Date(e.Completed).getTime() - new Date(e["Created Date"]).getTime()) / 3600000; if (h >= 0) { s += h; n++; } } });
       editSpeed = n ? +(s / n).toFixed(1) : null;
     } catch (e) { console.warn("[orders] monthly edit speed failed:", e.message); }
-    const out = { at: Date.now(), orderSpeed, editSpeed, ordersMonth, editsMonth };
+    /* EDIT REQUEST RATE. Definition matters -- vendors will argue about it, so it is
+       stated exactly here and surfaced in the UI tooltip:
+         editPct = edits OPENED this month against this vendor's work
+                   / orders this vendor FIRST-COMPLETED this month
+       (Edit speed above is a different cohort on purpose: edits RESOLVED this month.)
+
+       vendorErrorPct counts only edits a human has adjudicated as vendor_error. It is
+       returned as null until most of the month's edits are adjudicated (faultCoverage),
+       because publishing a fault rate computed from a half-labelled set is worse than
+       publishing nothing. The UI slot exists now and lights up on its own. */
+    // Vendor-facing rate is ALL edits (fault-blind). Fault/vendor-error is admin-only and
+    // computed separately on the dashboard, so it is neither computed nor sent here.
+    let editPct = null, editsOpened = 0;
+    try {
+      let opened = await search("edit_request", [
+        { key: "Assigned_Artist", constraint_type: "equals", value: email },
+        { key: "Created Date", constraint_type: "greater than", value: monIso }]);
+      const flags = await Promise.all(opened.map(async (e) => {
+        try { const m = await search("uploaded_image", [{ key: "Order#", constraint_type: "equals", value: e["Order#"] }]); return !!(m[0] && m[0].use_new_system === true); }
+        catch (_) { return false; }
+      }));
+      opened = opened.filter((_, i) => flags[i]);
+      editsOpened = opened.length;
+      if (ordersMonth > 0) editPct = +((editsOpened / ordersMonth) * 100).toFixed(1);
+    } catch (e) { console.warn("[orders] monthly edit rate failed:", e.message); }
+    const out = { at: Date.now(), orderSpeed, editSpeed, ordersMonth, editsMonth, editsOpened, editPct };
     _speedCache.set(email, out);
     return out;
   }
@@ -568,6 +654,10 @@ function mountVendorPortal(app, deps) {
         actingAs: req.session.actingAs || null,
         monthlyTimer: sp.orderSpeed, monthlyEditTimer: sp.editSpeed,
         monthlyCount: sp.ordersMonth, monthlyEdits: sp.editsMonth,
+        // Vendor sees the all-edits rate only. vendorErrorPct is admin-only and is
+        // deliberately NOT included in this payload -- not just hidden in the UI, absent
+        // from the response, so it can't be read from the browser's network tab.
+        editPct: sp.editPct, editsOpened: sp.editsOpened,
         edits: editViews,
         claimable: claimableViews,
         claimed: claimedViews,
@@ -941,8 +1031,11 @@ function mountVendorPortal(app, deps) {
       openEdits.forEach((er) => {
         const no = String(er["Order#"] || ""); if (!no) return;
         if (!editByNo[no]) editByNo[no] = {
+          id: er._id,
           changes: er.Changes_Needed || "", reason: er.Edit_Reason || "",
           artist: er.Assigned_Artist || "", created: er["Created Date"] || null,
+          // Two fields only: the answer, and whether a human locked it.
+          fault: faultOf(er), locked: isLocked(er),
           refs: [["Reference 1", er.File_1], ["Reference 2", er.File_2]]
             .map(([label, v]) => { const u = linkifyD(v); return u ? { label, url: u } : null; }).filter(Boolean),
         };
@@ -996,7 +1089,7 @@ function mountVendorPortal(app, deps) {
       const byV = {};
       const bucket = (email) => {
         email = String(email || "").toLowerCase(); if (!email) return null;
-        if (!byV[email]) byV[email] = { op: 0, ag: 0, ep: 0, ot: 0, om: 0, et: 0, em: 0, osT: [0, 0], osM: [0, 0], esM: [0, 0], digOp: 0, otherOp: 0, digEp: 0, otherEp: 0 };
+        if (!byV[email]) byV[email] = { op: 0, ag: 0, ep: 0, ot: 0, om: 0, et: 0, em: 0, osT: [0, 0], osM: [0, 0], esM: [0, 0], digOp: 0, otherOp: 0, digEp: 0, otherEp: 0, eo: 0, ve: 0 };
         return byV[email];
       };
       const orderSpeedH = orderSpeedHours; // write-once stamps; see module-level helpers
@@ -1052,6 +1145,18 @@ function mountVendorPortal(app, deps) {
         totals.editsMonth = em.length;
         em.forEach((e) => { const b = bucket(e.Assigned_Artist); if (!b) return; b.em++; const h = editSpeedH(e); if (h != null) { b.esM[0] += h; b.esM[1]++; } });
       } catch (e) { console.warn("[dashboard] editsMonth failed:", e.message); totals.editsMonth = null; }
+      /* Per-vendor edit RATE and VENDOR-ERROR rate for the month. Denominator is b.om --
+         orders that vendor first-completed this month -- so the two numbers answer:
+         "of the work you finished, how much came back, and how much was actually our fault?"
+         Fault comes from edit_fault, which the classifier fills in automatically. */
+      try {
+        let opened = await search("edit_request", [{ key: "Created Date", constraint_type: "greater than", value: monIso }]);
+        opened = await gateEdits(opened);
+        opened.forEach((e) => { const b2 = bucket(e.Assigned_Artist); if (!b2) return; b2.eo++; if (faultOf(e) === "vendor_error") b2.ve++; });
+        totals.vendorErrorsMonth = opened.filter((e) => faultOf(e) === "vendor_error").length;
+        totals.editsOpenedMonth = opened.length;
+        totals.faultUnlabelled = opened.filter((e) => !faultOf(e)).length;
+      } catch (e) { console.warn("[dashboard] per-vendor edit rate failed:", e.message); }
 
       const avg = (pair) => (pair && pair[1]) ? +(pair[0] / pair[1]).toFixed(2) : null;
       const num = (a, ...ks) => { for (const k of ks) { const v = a[k]; if (v !== undefined && v !== null && v !== "") return Number(v) || 0; } return 0; };
@@ -1066,8 +1171,13 @@ function mountVendorPortal(app, deps) {
           digLoad: (b.digOp || 0) + (b.digEp || 0), otherLoad: (b.otherOp || 0) + (b.otherEp || 0),
           capabilities: Array.isArray(a.capabilities) ? a.capabilities.map((c) => String(c).toLowerCase()) : [],
           ordersPending: b.op || 0, editsPending: b.ep || 0, aging: b.ag || 0,
+          editsOpenedMonth: b.eo || 0, vendorErrorsMonth: b.ve || 0,
+          errorRateMonth: om ? +(((b.ve || 0) / om) * 100).toFixed(1) : null,
           orderSpeedToday: avg(b.osT), orderSpeedMonth: avg(b.osM), editSpeedMonth: avg(b.esM),
-          editPctMonth: om ? +((emc / om) * 100).toFixed(1) : null,
+          // Edits OPENED this month against this vendor's work / orders they completed this
+          // month. Same definition the vendor sees in their portal, on purpose -- two numbers
+          // that disagree is an argument waiting to happen. (Was: edits *finished* / orders.)
+          editPctMonth: om ? +(((b.eo || 0) / om) * 100).toFixed(1) : null,
           editsToday: b.et || 0, editsMonth: emc, ordersToday: b.ot || 0, ordersMonth: om,
         };
       }).sort((x, y) => (x.email > y.email ? 1 : -1));
@@ -1125,6 +1235,118 @@ function mountVendorPortal(app, deps) {
 
   // ---- TEMP DEBUG: raw record JSON (admin only) — REMOVE after field-name check.
   // /vendor/api/admin/raw?type=artist&id=<id>  (type defaults to uploaded_image)
+  /* One page of results, no pagination. search() walks the entire table (100 rows per
+     HTTP call), which is fine for small constrained queries and ruinous for edit_request:
+     at 1,000 edits/month that table is 12,000 rows -> 120 Bubble calls per scan. The fault
+     sweep and the stats bar must never full-scan. */
+  async function searchPage(type, constraints, limit = 100) {
+    const q = `constraints=${encodeURIComponent(JSON.stringify(constraints))}&cursor=0&limit=${limit}`;
+    const { response } = await bubble("GET", `/${type}?${q}`);
+    return { rows: response.results || [], remaining: response.remaining || 0 };
+  }
+  let _faultStats = null; // declared ahead of every reader/writer below
+
+  /* ---- Edit fault: auto-classify + human override ---------------------------
+     Only two fields are stored: edit_fault (the answer) and fault_locked (a human
+     set it). Config lives in ./fault-prompt.js. */
+
+  // Rows the classifier still owes work on: created after go-live, not yet labelled,
+  // not locked by a human. Bounded by the cutoff so history is never touched.
+  const NEEDS_CLASSIFY = [
+    { key: "Created Date", constraint_type: "greater than", value: FAULT_START_ISO },
+    { key: "edit_fault", constraint_type: "is_empty" },
+  ];
+  // Reclassify mode: labelled-but-unlocked rows -- used deliberately after you edit the
+  // prompt, never automatically. Still bounded by the cutoff.
+  const RECLASSIFY = [
+    { key: "Created Date", constraint_type: "greater than", value: FAULT_START_ISO },
+    { key: "fault_locked", constraint_type: "is_empty" },
+  ];
+
+  // Human override -> writes the answer AND locks the row from the classifier.
+  app.post("/vendor/api/admin/set-fault", express.json(), requireAdminLogin, async (req, res) => {
+    try {
+      const editId = String(req.body.editId || "");
+      const fault = normFault(req.body.fault);
+      if (!editId || !fault) return res.status(400).json({ ok: false, error: "editId and a valid fault are required" });
+      await bubble("PATCH", `/edit_request/${editId}`, { edit_fault: fault, fault_locked: "yes" });
+      _faultStats = null;
+      res.json({ ok: true, fault });
+    } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+  });
+
+  // Classify one edit and write the answer -- unless a human has locked it.
+  async function classifyOne(er) {
+    if (isLocked(er)) return { ok: true, skipped: true };
+    let order = null;
+    try { const m = await search("uploaded_image", [{ key: "Order#", constraint_type: "equals", value: er["Order#"] }]); order = m[0] || null; }
+    catch (e) { console.warn("[fault] order lookup failed:", e.message); }
+    const r = await classifyEditFault(er, order);
+    if (!r.ok) return r;
+    try { await bubble("PATCH", `/edit_request/${er._id}`, { edit_fault: r.fault }); }
+    catch (e) { return { ok: false, error: "classified but could not save: " + e.message }; }
+    _faultStats = null;
+    return r;
+  }
+
+  // Classify a batch on demand. mode "reclassify" re-runs unlocked rows after a prompt edit.
+  app.post("/vendor/api/admin/classify-batch", express.json(), requireAdminLogin, async (req, res) => {
+    if (!ANTHROPIC_KEY) return res.status(400).json({ ok: false, error: "ANTHROPIC_API_KEY not set on this service" });
+    const limit = Math.min(Math.max(Number(req.body.limit) || 25, 1), 50);
+    const constraints = req.body.mode === "reclassify" ? RECLASSIFY : NEEDS_CLASSIFY;
+    try {
+      const page = await searchPage("edit_request", constraints, limit);
+      let done = 0; const errors = [];
+      for (const er of page.rows) {
+        const r = await classifyOne(er);
+        if (r.ok) { if (!r.skipped) done++; } else errors.push(`${er["Order#"] || er._id}: ${r.error}`);
+      }
+      res.json({ ok: true, classified: done, attempted: page.rows.length, remaining: page.remaining, errors: errors.slice(0, 5) });
+    } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+  });
+
+  // Small scoreboard for the admin bar. Scoped to a rolling window and cached.
+  const FAULT_STATS_TTL = 15 * 60 * 1000;
+  const FAULT_STATS_DAYS = 30;
+  app.get("/vendor/api/admin/fault-stats", requireAdminLogin, async (_req, res) => {
+    if (_faultStats && Date.now() - _faultStats.at < FAULT_STATS_TTL) return res.json(_faultStats.body);
+    try {
+      const win = new Date(Date.now() - FAULT_STATS_DAYS * 86400000).toISOString();
+      const since = win > FAULT_START_ISO ? win : FAULT_START_ISO;
+      const all = await search("edit_request", [{ key: "Created Date", constraint_type: "greater than", value: since }]);
+      const labelled = all.filter((er) => faultOf(er));
+      const byCode = {};
+      FAULT_CODES.forEach((c) => { byCode[c] = labelled.filter((er) => faultOf(er) === c).length; });
+      const body = {
+        ok: true, windowDays: FAULT_STATS_DAYS, startedAt: FAULT_START_ISO,
+        total: all.length, labelled: labelled.length,
+        locked: all.filter((er) => isLocked(er)).length,
+        pending: all.filter((er) => !faultOf(er)).length,
+        model: FAULT_MODEL, keyPresent: !!ANTHROPIC_KEY, byCode,
+      };
+      _faultStats = { at: Date.now(), body };
+      res.json(body);
+    } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+  });
+
+  // Background auto-classifier: one constrained page every AUTO_CLASSIFY_MIN minutes.
+  async function autoClassifySweep() {
+    if (!ANTHROPIC_KEY) return;
+    try {
+      const { rows, remaining } = await searchPage("edit_request", NEEDS_CLASSIFY, SWEEP_BATCH);
+      if (!rows.length) return;
+      let ok = 0;
+      for (const er of rows) { const r = await classifyOne(er); if (r.ok && !r.skipped) ok++; }
+      console.log(`[fault-sweep] classified ${ok}/${rows.length} edit(s) with ${FAULT_MODEL}; ${remaining} waiting`);
+    } catch (e) { console.warn("[fault-sweep] failed:", e.message); }
+  }
+  if (ANTHROPIC_KEY) {
+    setTimeout(autoClassifySweep, 30 * 1000);
+    setInterval(autoClassifySweep, AUTO_CLASSIFY_MIN * 60 * 1000);
+  } else {
+    console.warn("[fault] ANTHROPIC_API_KEY not set -- edit fault classification is off");
+  }
+
   // TEMP diagnostic: surfaces exactly why completion mail might not send.
   //   /vendor/api/admin/email-test                       -> is the key present? what's the From?
   //   /vendor/api/admin/email-test?to=you@example.com    -> actually send a test, report SendGrid status+body
@@ -1416,6 +1638,24 @@ table.stats td.g,table.stats td.o,table.stats td.r{font-weight:700}.g{color:#16a
 .multibanner{display:flex;gap:8px;background:#fee2e2;color:#991b1b;border-radius:8px;padding:9px 12px;font-size:13px;font-weight:700;margin-bottom:12px}
 .eligbox{margin-top:10px;padding:10px 12px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px}
 .editreqbox{margin:10px 0;padding:10px 12px;background:#fffbeb;border:1px solid #fde68a;border-radius:8px}
+.faultbar{display:flex;flex-wrap:wrap;align-items:center;gap:14px;background:#fff;border:1px solid #e6ebf1;border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:13px}
+.fbstat{color:#64748b}
+.faultbox{margin-top:10px;padding-top:10px;border-top:1px dashed #fcd34d}
+.faultrow{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:6px}
+.faultpill{font-size:12px;font-weight:700;padding:3px 9px;border-radius:999px}
+.faultpill.f-vendor_error{background:#fee2e2;color:#b91c1c}
+.faultpill.f-client_change{background:#dcfce7;color:#15803d}
+.faultpill.f-unclear{background:#e2e8f0;color:#475569}
+.faultby{font-size:12px;color:#94a3b8}
+.faultbtn{font-size:12px;font-weight:600;padding:5px 10px;border-radius:7px;border:1px solid #d8dee6;background:#fff;color:#334155;cursor:pointer}
+.faultbtn:hover{background:#f8fafc}
+.faultbtn.on{background:#0f172a;border-color:#0f172a;color:#fff}
+.faultai{font-size:12px;font-weight:600;padding:5px 10px;border-radius:7px;border:1px solid #c7d2fe;background:#eef2ff;color:#4338ca;cursor:pointer}
+.faultghost{font-size:12px;font-weight:600;padding:5px 10px;border-radius:7px;border:1px solid #d8dee6;background:#fff;color:#64748b;cursor:pointer}.faultghost:hover{background:#f8fafc}
+.faultai:hover{background:#e0e7ff}
+.faultmsg{font-size:12px;font-weight:600}
+.aisugg{margin-top:8px;padding:8px 10px;background:#eef2ff;border:1px solid #e0e7ff;border-radius:7px;font-size:12.5px;color:#3730a3}
+.airat{margin-top:3px;color:#4c51bf;font-weight:400}
 .editreqbox .tmpl-label{color:#92400e}
 .eref{display:inline-block;margin-right:8px;color:#2563eb;font-size:13px;text-decoration:underline}
 .msgwrap{margin-top:16px;border-top:1px solid #eef2f6;padding-top:14px}
@@ -1440,6 +1680,7 @@ table.stats td.g,table.stats td.o,table.stats td.r{font-weight:700}.g{color:#16a
 <div class=tabs><button class="tab active" id=tabOrders onclick="showTab('orders')">Orders</button><button class=tab id=tabVendors onclick="showTab('vendors')">By Vendor</button></div>
 <div id=paneOrders>
   <div id=kpis></div>
+  <div id=faultbar></div>
   <div id=msgbox></div>
   <div class=toolbar>
     <label>Search <input id=fSearch type=text placeholder="Order #" oninput="setFilter()" style=width:120px></label>
@@ -1568,7 +1809,8 @@ function renderStats(){
   var a=DATA.artists||[];if(!a.length){document.getElementById('stats').textContent='No vendors.';return;}
   var cols=[['ordersPending','Orders Pending'],['editsPending','Edits Pending'],['aging','Aging Orders'],
     ['orderSpeedToday','Order Speed Today','spd'],['orderSpeedMonth','Order Speed Month','spd'],['editSpeedMonth','Edit Speed Month','spd'],
-    ['editPctMonth','Edit % Month','pct'],['editsToday','Edits Finished Today'],['editsMonth','Edits Finished Month'],['ordersToday','Orders Finished Today'],['ordersMonth','Orders Finished Month']];
+    ['editPctMonth','Edit % Month','pct'],['errorRateMonth','Vendor Error % Month','pct'],['vendorErrorsMonth','Vendor Errors Month'],
+    ['editsToday','Edits Finished Today'],['editsMonth','Edits Finished Month'],['ordersToday','Orders Finished Today'],['ordersMonth','Orders Finished Month']];
   var h='<table class=stats><tr><th class=vn>By Artist</th>';cols.forEach(function(c){h+='<th>'+c[1]+'</th>';});h+='</tr>';
   a.forEach(function(v){h+='<tr><td class=vn><span class="dot '+(v.active?'on':'off')+'"></span>'+esc(v.contact||v.email||'(no email)')+'<div class=osub>'+esc(v.email||'')+'</div></td>';
     cols.forEach(function(c){var val=v[c[0]];var cls=c[2]==='spd'?spdClass(val):(c[2]==='pct'?pctClass(val):'');var disp=(val==null||val==='')?'\\u2013':(c[2]==='pct'?val+'%':val);h+='<td class="'+cls+'">'+disp+'</td>';});h+='</tr>';});
@@ -1587,6 +1829,70 @@ function eligibleFor(o){
     var cap=dig?a.capDig:a.capOther;cap=(cap==null||cap==='')?null:Number(cap);
     return {email:a.email,contact:a.contact,load:load,cap:cap,bucket:(dig?'digitizing':'other'),under:(cap!=null&&load<cap)};
   });
+}
+// Small fault scoreboard. Auto-classifies in the background; a human override locks a row.
+// After editing fault-prompt.js, use "Re-classify" to re-run every unlocked edit.
+async function renderFaultBar(){
+  var el=document.getElementById('faultbar');if(!el)return;
+  try{
+    const r=await fetch('/vendor/api/admin/fault-stats');const d=await r.json();
+    if(!d.ok){el.innerHTML='';return;}
+    var n=(d.pending>25?25:d.pending);
+    var btn=d.keyPresent?'<button class=faultai onclick="classifyBatch()">\\u2728 Classify '+n+' now</button>':'<span class=faultby>ANTHROPIC_API_KEY not set</span>';
+    var codes=d.byCode||{};
+    el.innerHTML='<div class=faultbar><b>Edit fault</b>'+
+      '<span class=fbstat title="Rolling '+d.windowDays+'-day window. Edits before go-live are never classified.">'+d.labelled+' / '+d.total+' classified</span>'+
+      '<span class=fbstat>since '+shortDate(d.startedAt)+'</span>'+
+      '<span class=fbstat title="Human overrides that the classifier will not touch.">'+d.locked+' locked</span>'+
+      '<span class=fbstat><span class=faultpill f-vendor_error>'+(codes.vendor_error||0)+'</span> <span class=faultpill f-client_change>'+(codes.client_change||0)+'</span> <span class=faultpill f-unclear>'+(codes.unclear||0)+'</span></span>'+
+      (d.pending?'<span class=fbstat>'+d.pending+' pending</span>':'')+
+      (d.pending?btn:'')+(d.keyPresent&&d.labelled?'<button class=faultghost onclick="reclassifyAll()" title="Re-run every unlocked edit through the current prompt. Locked (human-set) rows are untouched.">Re-classify</button>':'')+'<span id=fbMsg class=faultmsg></span></div>';
+  }catch(e){el.innerHTML='';}
+}
+async function reclassifyAll(){
+  if(!confirm('Re-run the classifier on all UNLOCKED edits with the current prompt? Rows you set by hand are untouched.'))return;
+  var m=document.getElementById('fbMsg');if(m){m.style.color='#64748b';m.textContent='Re-classifying\\u2026';}
+  try{
+    const r=await fetch('/vendor/api/admin/classify-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:50,mode:'reclassify'})});
+    const d=await r.json();
+    if(d.ok){if(m){m.style.color='#16a34a';m.textContent='Re-classified '+d.classified+(d.remaining?' \\u00b7 '+d.remaining+' left (click again)':'');}renderFaultBar();load();}
+    else if(m){m.style.color='#dc2626';m.textContent=d.error||'Failed';}
+  }catch(e){if(m){m.style.color='#dc2626';m.textContent='Failed';}}
+}
+async function classifyBatch(){
+  var m=document.getElementById('fbMsg');if(m){m.style.color='#64748b';m.textContent='Classifying\\u2026';}
+  try{
+    const r=await fetch('/vendor/api/admin/classify-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:25})});
+    const d=await r.json();
+    if(d.ok){if(m){m.style.color='#16a34a';m.textContent='Classified '+d.classified+' of '+d.attempted+(d.remaining?' \\u00b7 '+d.remaining+' left':'');}renderFaultBar();load();}
+    else if(m){m.style.color='#dc2626';m.textContent=d.error||'Failed';}
+  }catch(e){if(m){m.style.color='#dc2626';m.textContent='Failed';}}
+}
+function shortDate(iso){if(!iso)return '\\u2013';var d=new Date(iso);return isNaN(d)?'\\u2013':d.toLocaleDateString([],{month:'short',day:'numeric'});}
+function faultLabel(f){return f==='vendor_error'?'Our mistake':(f==='client_change'?'Client change':(f==='unclear'?'Unclear':''));}
+// Fault box: shows the current label and three override buttons. An override LOCKS the row.
+function faultBoxHtml(er){
+  if(!er.id)return '';
+  var cur=er.fault||'';
+  var who=cur?(er.locked?'set by you':'auto-classified'):'awaiting classification';
+  var chosen=cur?'<span class="faultpill f-'+cur+'">'+faultLabel(cur)+'</span><span class=faultby>'+who+'</span>'
+                :'<span class=faultby>'+who+'</span>';
+  var btns=['vendor_error','client_change','unclear'].map(function(f){
+    return '<button class="faultbtn'+(cur===f?' on':'')+'" onclick="setFault(\\''+er.id+'\\',\\''+f+'\\')">'+faultLabel(f)+'</button>';
+  }).join('');
+  return '<div class=faultbox><div class=tmpl-label>Fault</div>'+
+    '<div class=faultrow>'+chosen+'</div>'+
+    '<div class=faultrow><span class=faultby>Override:</span>'+btns+'</div>'+
+    '<div id=faultMsg class=faultmsg></div></div>';
+}
+async function setFault(editId,fault){
+  var m=document.getElementById('faultMsg');if(m){m.style.color='#64748b';m.textContent='Saving\\u2026';}
+  try{
+    const r=await fetch('/vendor/api/admin/set-fault',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({editId:editId,fault:fault})});
+    const d=await r.json();
+    if(d.ok){if(m){m.style.color='#16a34a';m.textContent='Saved \\u0026 locked.';}load();renderFaultBar();}
+    else if(m){m.style.color='#dc2626';m.textContent=d.error||'Could not save';}
+  }catch(e){if(m){m.style.color='#dc2626';m.textContent='Could not save';}}
 }
 function vendList(arr){
   if(!arr.length)return '<div style=font-size:13px;color:#94a3b8>none</div>';
@@ -1623,7 +1929,8 @@ function fillPanel(o){
       (er.reason?'<div class=specline><b>Reason:</b> '+esc(er.reason)+'</div>':'')+
       (er.artist?'<div class=specline><b>Working it:</b> '+esc(shortUser(er.artist))+'</div>':'')+
       (erAgo?'<div class=specline><b>Requested:</b> '+esc(erAgo)+'</div>':'')+
-      (refs?'<div class=specline><b>References:</b> '+refs+'</div>':'')+'</div>';
+      (refs?'<div class=specline><b>References:</b> '+refs+'</div>':'')+
+      faultBoxHtml(er)+'</div>';
   }
   panel.innerHTML='<div class=phead><div><div class=ptitle>Order '+esc(o.orderNo||o.id)+'</div><div class=peyebrow>'+esc(o.type||'')+(o.ref?' \\u00b7 PO '+esc(o.ref):'')+'</div></div><button class=pclose onclick="closeDetail()">\\u2715</button></div>'+
     '<div class=pbody>'+multi+'<div>'+badges+'</div>'+thumb+editReq+
@@ -1662,6 +1969,10 @@ function cancelOrder(id){
 }
 async function logout(){await fetch('/vendor/api/logout',{method:'POST'});location.href='/vendor/login';}
 load();
+// Fetched once per page open, NOT in the 30s poll: the stats scan is the single most
+// expensive query in this system, and polling it would burn workflow units for a number
+// that barely moves. Re-rendered explicitly after any fault action.
+renderFaultBar();
 setInterval(function(){if(!panelOpenId)load();},30000);
 </script></body></html>`;
 
@@ -1726,6 +2037,10 @@ main{max-width:880px;margin:18px auto;padding:0 16px}
 .limbar.allfull{border-color:#fecaca;background:#fff7f7}
 .limline{font-size:14px;color:#0f172a}
 .limnote{font-size:12.5px;color:#64748b;margin-top:4px}
+.limmetrics{display:flex;flex-wrap:wrap;gap:22px;margin:12px 0 2px}
+.limmetrics .met{display:flex;flex-direction:column;line-height:1.25}
+.limmetrics .met b{font-size:19px;font-weight:800;color:#0f172a}
+.limmetrics .met span{font-size:11.5px;color:#64748b;margin-top:2px}
 .limmax{margin-top:10px;background:#fff7ed;border:1px solid #fed7aa;color:#9a3412;border-radius:8px;padding:9px 12px;font-size:13px;font-weight:600}
 .mailme{display:flex;align-items:center;gap:10px;margin:14px 0 4px;flex-wrap:wrap}
 .mailbtn{background:#f1f5f9;color:#334155;border:1px solid #dbe3ea;border-radius:8px;padding:8px 13px;font-size:13px;font-weight:600;cursor:pointer}
@@ -1799,6 +2114,16 @@ function limitsBarHtml(){
   var ol=data.otherLoad!=null?data.otherLoad:0,oc=data.capOther!=null?data.capOther:0;
   var digFull=!data.underDig,othFull=!data.underOther;
   var line='<div class=limline><b>Your limits</b> \\u00b7 Digitizing '+dl+'/'+dc+' \\u00b7 Vector + DTF '+ol+'/'+oc+'</div>';
+  // Live monthly metrics. "Edit request rate" is deliberately NOT called an error rate:
+  // it counts every edit, including client change-requests that were never our fault.
+  var mt=(data.monthlyTimer!=null&&data.monthlyTimer!=='')?(data.monthlyTimer+'h'):'\\u2013';
+  var met=(data.monthlyEditTimer!=null&&data.monthlyEditTimer!=='')?(data.monthlyEditTimer+'h'):'\\u2013';
+  var ep=(data.editPct!=null)?(data.editPct+'%'):'\\u2013';
+  var mets='<div class=limmetrics>'+
+    '<span class=met title="Average hours from claiming an order to completing it, this month"><b>'+esc(String(mt))+'</b><span>New order speed</span></span>'+
+    '<span class=met title="Average hours from an edit being requested to you resolving it, this month"><b>'+esc(String(met))+'</b><span>Edit speed</span></span>'+
+    '<span class=met title="Edits opened this month on your work, divided by the orders you completed this month. Includes client change requests, which are not vendor errors."><b>'+esc(String(ep))+'</b><span>Edit request rate</span></span>'+
+    '</div>';
   var note='<div class=limnote>We actively monitor turn time and edit request % to increase the number of jobs you can claim.</div>';
   var callout='';
   if(digFull&&othFull){
@@ -1808,7 +2133,7 @@ function limitsBarHtml(){
   }else if(othFull){
     callout='<div class=limmax>\\u26D4 You\\'re at your Vector + DTF limit ('+ol+'/'+oc+'). Complete one to claim another.'+(dc>0?' You still have '+(dc-dl)+' Digitizing slot'+((dc-dl)===1?'':'s')+' open.':'')+'</div>';
   }
-  return '<div class="limbar'+((digFull&&othFull)?' allfull':'')+'">'+line+note+callout+'</div>';
+  return '<div class="limbar'+((digFull&&othFull)?' allfull':'')+'">'+line+mets+note+callout+'</div>';
 }
 function groupHtml(label,arr,state){
   if(!arr.length)return '';
