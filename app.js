@@ -58,6 +58,19 @@ function readNum(a, ...keys) {
 }
 // Which cap bucket an order/edit falls in: digitizing vs everything else.
 const bucketOf = (orderType) => (orderType === "Digitizing" ? "digitizing" : "other");
+
+/* WRITE-ONCE claim timestamp. claimed_at is re-stamped by forceAssign, so once an
+   admin reassigns an edited order the original claim time is lost and any
+   claim->completion duration goes negative. first_claimed_at never moves.
+   The write is separate and guarded on purpose: Bubble rejects an entire PATCH on an
+   unknown field key (editor labels != API keys), and a metrics field must never be
+   able to break the claim it is measuring. */
+const FIRST_CLAIMED_KEYS = ["first_claimed_at", "First_claimed_at"];
+async function stampFirstClaimed(orderId, order) {
+  for (const k of FIRST_CLAIMED_KEYS) if (order && order[k]) return; // already stamped
+  try { await patchOrder(orderId, { first_claimed_at: Date.now() }); }
+  catch (e) { console.warn(`[stamp] first_claimed_at failed for ${orderId}:`, e.message); }
+}
 const CS = { unclaimed: "unclaimed", claimed: "claimed", review: "needs_review", completed: "completed", edit: "edit_requested" };
 
 // use_new_system is a real yes/no field -> Bubble returns boolean true/false.
@@ -242,6 +255,7 @@ async function tryClaim(orderId, email) {
     if (blocker) return { ok: false, reason: "claim_oldest_first" };
   }
   await patchOrder(orderId, { [F.claimState]: CS.claimed, [F.assignedArtist]: email, [F.claimedAt]: Date.now() });
+  await stampFirstClaimed(orderId, o);
   console.log(`[claimed] order ${orderId} by ${email} (from shared pool)`);
   await logEvent(orderId, email, "claimed", "from shared pool");
   return { ok: true };
@@ -261,6 +275,7 @@ async function forceAssign(orderId, email) {
     [F.assignedArtist]: email,
     [F.claimedAt]: Date.now(),
   });
+  await stampFirstClaimed(orderId, o);
   const over = open + 1 > bucketCap;
   console.log(`[force-assigned] order ${orderId} -> ${email} (${bucket} now ${open + 1}/${bucketCap}${over ? ", OVER cap" : ""})`);
   await logEvent(orderId, email, "admin_force_assigned",
