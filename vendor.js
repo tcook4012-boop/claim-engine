@@ -1533,8 +1533,21 @@ function mountVendorPortal(app, deps) {
 
   app.get("/vendor/api/admin/raw", requireAdminLogin, async (req, res) => {
     try {
-      const type = String(req.query.type || "uploaded_image");
+      // Editor labels != Data API type names. Alias the names we keep mistyping so the
+      // debug route resolves regardless of casing/pluralization.
+      const TYPE_ALIAS = {
+        new_orders: "New_Order", new_order: "New_Order", "New_Orders": "New_Order",
+        order_messages: "order_message", edit_requests: "edit_request",
+        artists: "artist", users: "user", teams: "team",
+      };
+      const raw = String(req.query.type || "uploaded_image");
+      const type = TYPE_ALIAS[raw] || raw;
       const id = String(req.query.id || "");
+      // No id -> list a few rows so we can discover the real field keys.
+      if (!id) {
+        const rows = await bubble("GET", `/${type}?limit=3`).then(r => r.response.results || []);
+        return res.type("json").send(JSON.stringify({ type, count: rows.length, sample: rows }, null, 2));
+      }
       const rec = await bubble("GET", `/${type}/${id}`).then(r => r.response);
       res.type("json").send(JSON.stringify(rec, null, 2));
     } catch (e) { res.status(500).json({ error: e.message }); }
