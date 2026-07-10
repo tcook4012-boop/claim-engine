@@ -18,6 +18,10 @@ const cookieParser = require("cookie-parser");
 const bcrypt = require("bcryptjs");
 const multer = require("multer");
 const crypto = require("crypto");
+const { execFile } = require("child_process");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 
 // In-memory session store. Sessions are lost on restart (vendors just log in
 // again) -- fine for a prototype. Move to Bubble/Redis later if needed.
@@ -379,15 +383,20 @@ function mountVendorPortal(app, deps) {
   async function newOrdersDetail(orderNo) {
     if (!orderNo) return null;
     try {
-      const rows = await search("new_orders", [{ key: "Order#", constraint_type: "equals", value: orderNo }]);
+      // Bubble Data API type is "New_Order" (capital, singular) -- NOT "new_orders".
+      // This was silently returning null before, blanking digitizing specs.
+      const rows = await search("New_Order", [{ key: "Order#", constraint_type: "equals", value: orderNo }]);
       const n = rows[0];
       if (!n) return null;
+      const pick = (...keys) => { for (const k of keys) { const v = n[k]; if (v !== undefined && v !== null && v !== "") return v; } return ""; };
       return {
         puff: n["3D_Puff"] === true ? "Yes" : (n["3D_Puff"] === false ? "No" : ""),
-        fabric: n.fabric_content || "",
-        placement: n.Placement || "",
+        fabric: pick("fabric_content", "Fabric_content"),
+        placement: pick("Placement", "placement"),
+        proportionalTo: pick("Proportional_to", "proportional_to", "Proportional_To"),
+        dimension: pick("Dimension", "dimension"),
       };
-    } catch (e) { console.warn("[orders] new_orders lookup failed for " + orderNo + ":", e.message); return null; }
+    } catch (e) { console.warn("[orders] New_Order lookup failed for " + orderNo + ":", e.message); return null; }
   }
 
   // Per-vendor monthly speeds, COMPUTED from claim -> completion (order) and
@@ -755,6 +764,78 @@ function mountVendorPortal(app, deps) {
   }
 
   // Push one file's bytes through the scratch pad and return its hosted Bubble URL.
+  /* ---- DST quality checks (digitizing) --------------------------------------
+     Runs dst_check.py on the vendor's uploaded .dst, then compares the file's SIZE
+     and sew DIRECTION against what the ORIGINAL order requested (read from New_Order,
+     never from the vendor-overwritten uploaded_image). Returns:
+       { ran, pass, failures:[...], size, direction, preview }
+     Never throws: if anything goes wrong we return ran:false so the caller routes the
+     order to review rather than silently passing it. */
+  const SIZE_TOLERANCE_IN = Number(process.env.DST_SIZE_TOLERANCE || 0.1);
+
+  function runDstScript(filePath) {
+    return new Promise((resolve) => {
+      execFile("python3", [path.join(__dirname, "dst_check.py"), filePath], { maxBuffer: 20 * 1024 * 1024, timeout: 30000 }, (err, stdout) => {
+        if (err && !stdout) return resolve({ ok: false, error: err.message });
+        try { resolve(JSON.parse(stdout)); } catch (e) { resolve({ ok: false, error: "bad checker output: " + String(stdout).slice(0, 120) }); }
+      });
+    });
+  }
+
+  // Parse the expected sew direction from the order's Placement string.
+  function expectedDirection(placement) {
+    const p = String(placement || "").toLowerCase();
+    if (p.includes("center-out") || p.includes("center out") || p.includes("bottom-up") || p.includes("bottom up")) return "center_out";
+    if (p.includes("left to right") || p.includes("left-to-right")) return "left_to_right";
+    return null; // unknown / blank -> skip direction check
+  }
+
+  async function runDstChecks(dstFile, newOrder) {
+    const result = { ran: false, pass: true, failures: [], notes: [] };
+    if (!dstFile) return result;
+    let tmp = "";
+    try {
+      tmp = path.join(os.tmpdir(), `dst_${Date.now()}_${Math.random().toString(36).slice(2)}.dst`);
+      fs.writeFileSync(tmp, dstFile.buffer);
+      const r = await runDstScript(tmp);
+      result.ran = true;
+      if (!r || r.ok === false) { result.pass = false; result.failures.push("Could not analyze the DST file" + (r && r.error ? ` (${r.error})` : "")); return result; }
+      result.size = r.sizeInches || null;
+      result.direction = r.direction || null;
+      result.preview = r.preview || null;
+      if (Array.isArray(r.notes)) result.notes.push(...r.notes);
+
+      // SIZE check: Proportional_to picks the axis, Dimension is the target (a string).
+      const prop = String((newOrder && newOrder.proportionalTo) || "").toLowerCase();
+      const dim = parseFloat(String((newOrder && newOrder.dimension) || "").replace(/[^0-9.]/g, ""));
+      if (prop && !isNaN(dim) && r.sizeInches) {
+        const actual = prop.startsWith("tall") ? r.sizeInches.h : (prop.startsWith("wide") ? r.sizeInches.w : null);
+        if (actual != null) {
+          const off = Math.abs(actual - dim);
+          if (off > SIZE_TOLERANCE_IN)
+            result.failures.push(`Size off: requested ${dim}" ${prop === "tall" ? "tall" : "wide"}, file is ${actual.toFixed(2)}" (off by ${off.toFixed(2)}", tolerance ${SIZE_TOLERANCE_IN}")`);
+        }
+      } else {
+        result.notes.push("Size not checked (order missing Proportional_to/Dimension).");
+      }
+
+      // DIRECTION check: compare the order's expected direction to the file's.
+      const want = expectedDirection(newOrder && newOrder.placement);
+      if (want && r.direction && r.direction !== "unclear") {
+        if (r.direction !== want)
+          result.failures.push(`Sew direction: order expects ${want === "center_out" ? "center-out/bottom-up (cap)" : "left-to-right (flat)"}, but the file appears to sew ${r.direction === "center_out" ? "center-out" : "left-to-right"}`);
+      } else if (want && r.direction === "unclear") {
+        result.notes.push("Sew direction inconclusive from the stitch file.");
+      }
+
+      result.pass = result.failures.length === 0;
+      return result;
+    } catch (e) {
+      result.ran = true; result.pass = false; result.failures.push("QA check error: " + e.message);
+      return result;
+    } finally { if (tmp) { try { fs.unlinkSync(tmp); } catch (_) {} } }
+  }
+
   async function uploadFileGetUrl(orderId, file) {
     await patchOrder(orderId, { vendor_scratch_file: bubbleFile(file) });
     const fresh = await getOrder(orderId);
@@ -885,10 +966,35 @@ function mountVendorPortal(app, deps) {
       const logos = String(req.body.logos || "").trim();
       if (!logos) return res.status(400).json({ ok: false, error: "Number of logos is required" });
 
+      // ---- Automated QA on digitizing uploads --------------------------------
+      // Find the .dst among supporting files, run size + direction checks against the
+      // ORIGINAL request (New_Order table). A failure routes the order to needs_review
+      // instead of completed; a pass completes normally. Skipped for edit re-submits
+      // (the client already asked for specific changes) and non-digitizing orders.
+      let qa = { ran: false, pass: true, failures: [], preview: null };
+      if (isEmbroidery && !isEditSubmit) {
+        const dstFile = supportFiles.find((f) => /\.dst$/i.test(f.originalname || ""));
+        if (dstFile) {
+          const no = await newOrdersDetail(o["Order#"]);
+          qa = await runDstChecks(dstFile, no);
+          console.log(`[qa] order ${o["Order#"]}: ran=${qa.ran} pass=${qa.pass} failures=${qa.failures.length}`);
+        } else {
+          console.log(`[qa] order ${o["Order#"]}: no .dst among uploads -- skipped`);
+        }
+      }
+      const goToReview = qa.ran && !qa.pass;
+
       const patch = {
-        Pending: false, Edit_Requested: false, [F.claimState]: "completed",
+        Pending: false, Edit_Requested: false,
+        [F.claimState]: goToReview ? "needs_review" : "completed",
         artist_reported_count: Number(logos),
       };
+      if (goToReview) {
+        // Store why it failed + the preview so the admin review slide-over can show it.
+        patch.review_reasons = qa.failures.join(" | ");
+        patch.review_flagged_at = Date.now();
+        if (qa.preview) patch.review_preview = "data:image/png;base64," + qa.preview;
+      }
 
       if (isEmbroidery) {
         // Bubble's Height/Width/Stitch_Count are TEXT fields (the read side falls back to
@@ -917,13 +1023,11 @@ function mountVendorPortal(app, deps) {
       // back to false (in patch above) and writes the revised files onto the order.
       await patchOrder(orderId, patch);
 
-      // WRITE-ONCE first-completion stamp. Two guards, both needed:
+      // WRITE-ONCE first-completion stamp. Skipped when the order is going to review --
+      // it isn't actually completed yet. Two additional guards, both needed:
       //   !isEditSubmit  -- an edit re-upload must never move the original completion time
       //   !firstCompletedOf(o) -- nor may a plain re-upload before any edit exists
-      // Deliberately a SEPARATE, guarded write (like the message_sent flag below): Bubble
-      // rejects an entire PATCH on an unknown field key, and a metrics field must never be
-      // able to fail the completion it is measuring.
-      if (!isEditSubmit && !firstCompletedOf(o)) {
+      if (!goToReview && !isEditSubmit && !firstCompletedOf(o)) {
         try { await patchOrder(orderId, { first_completed_at: Date.now() }); }
         catch (e) { console.warn("[stamp] first_completed_at write failed:", e.message); }
       }
@@ -947,22 +1051,75 @@ function mountVendorPortal(app, deps) {
         catch (e) { console.warn("[upload] scratch clear failed:", e.message); }
       }
 
-      // Client "your order is ready" email. Fires on BOTH triggers: original order
-      // completion and edit-request completion. The original completion sends once per
-      // order (guarded by message_sent) so a re-upload won't double-send; an edit
-      // completion is its own client-facing event and always sends.
-      if (isEditSubmit) {
-        await sendCompletionEmail(o);
-      } else if (String(o.message_sent || "").toLowerCase() !== "yes") {
-        await sendCompletionEmail(o);
-        try { await patchOrder(orderId, { message_sent: "yes" }); }
-        catch (e) { console.warn("[email] message_sent flag write failed:", e.message); }
+      // Client "your order is ready" email -- ONLY when the order is actually complete.
+      // An order routed to review has NOT passed, so the client is not notified yet; the
+      // email fires later when an admin approves it.
+      if (!goToReview) {
+        if (isEditSubmit) {
+          await sendCompletionEmail(o);
+        } else if (String(o.message_sent || "").toLowerCase() !== "yes") {
+          await sendCompletionEmail(o);
+          try { await patchOrder(orderId, { message_sent: "yes" }); }
+          catch (e) { console.warn("[email] message_sent flag write failed:", e.message); }
+        }
       }
 
-      await logEvent(orderId, email, isEditSubmit ? "edit_revised" : "completed_uploaded",
-        `${previewFile ? "preview" : "no preview"}; ${supportFiles.length} supporting file(s)`);
+      await logEvent(orderId, email, goToReview ? "flagged_for_review" : (isEditSubmit ? "edit_revised" : "completed_uploaded"),
+        goToReview ? qa.failures.join(" | ") : `${previewFile ? "preview" : "no preview"}; ${supportFiles.length} supporting file(s)`);
       touchArtist(req.session, { upload: true });
-      res.json({ ok: true, edit: isEditSubmit, preview: !!previewFile, supporting: supportFiles.length });
+      res.json({ ok: true, edit: isEditSubmit, review: goToReview, failures: goToReview ? qa.failures : [], preview: !!previewFile, supporting: supportFiles.length });
+    } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+  });
+
+  // ---- REVIEW BUCKET: approve or reject a QA-flagged order -----------------
+  // Approve: the order passes after human review -> complete it and fire the client
+  // "your order is ready" email (once, guarded like the normal completion path).
+  app.post("/vendor/api/admin/review-approve", express.json(), requireAdminLogin, async (req, res) => {
+    try {
+      const id = String(req.body.id || "");
+      if (!id) return res.status(400).json({ ok: false, error: "Need order id" });
+      const o = await getOrder(id);
+      if (!o) return res.status(404).json({ ok: false, error: "Order not found" });
+      await patchOrder(id, { [F.claimState]: "completed", Pending: false, review_reasons: "", review_flagged_at: "" });
+      // First-completion stamp (write-once) now that it's truly complete.
+      if (!firstCompletedOf(o)) { try { await patchOrder(id, { first_completed_at: Date.now() }); } catch (_) {} }
+      if (String(o.message_sent || "").toLowerCase() !== "yes") {
+        await sendCompletionEmail(o);
+        try { await patchOrder(id, { message_sent: "yes" }); } catch (_) {}
+      }
+      try { await logEvent(id, req.session.email || "admin", "review_approved", "admin approved flagged order"); } catch {}
+      console.log(`[review] order ${o["Order#"] || id} APPROVED by ${req.session.email || "admin"}`);
+      res.json({ ok: true });
+    } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+  });
+
+  // Reject: send it back to the vendor with notes, like an edit. The order returns to the
+  // vendor's claimed queue; the rejection note rides on Special_Instructions-style feedback.
+  app.post("/vendor/api/admin/review-reject", express.json(), requireAdminLogin, async (req, res) => {
+    try {
+      const id = String(req.body.id || "");
+      const notes = String(req.body.notes || "").trim();
+      if (!id) return res.status(400).json({ ok: false, error: "Need order id" });
+      if (!notes) return res.status(400).json({ ok: false, error: "Rejection notes are required" });
+      const o = await getOrder(id);
+      if (!o) return res.status(404).json({ ok: false, error: "Order not found" });
+      // Back to the assigned vendor as claimed work, with the reviewer's notes attached.
+      await patchOrder(id, {
+        [F.claimState]: "claimed", Pending: true,
+        review_reasons: "", review_flagged_at: "",
+        review_rejected_notes: notes, review_rejected_at: Date.now(),
+      });
+      // Message the vendor the rejection so it surfaces in their thread.
+      try {
+        await bubble("POST", "/order_message", {
+          order_no: o["Order#"] || "", sender_role: "admin", sender_email: req.session.email || "admin",
+          body: "Your submission was returned for changes: " + notes,
+          read_by_admin: true, read_by_vendor: false,
+        });
+      } catch (e) { console.warn("[review] reject message failed:", e.message); }
+      try { await logEvent(id, req.session.email || "admin", "review_rejected", notes); } catch {}
+      console.log(`[review] order ${o["Order#"] || id} REJECTED by ${req.session.email || "admin"}: ${notes}`);
+      res.json({ ok: true });
     } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
   });
 
@@ -1080,13 +1237,19 @@ function mountVendorPortal(app, deps) {
   // ---- ADMIN ORDERS DASHBOARD: all pending orders + push/reassign/cancel -----
   app.get("/vendor/api/admin/dashboard", requireAdminLogin, async (_req, res) => {
     try {
-      const [artists, pending, allOpenEdits] = await Promise.all([
+      const [artists, pendingRaw, allOpenEdits, reviewOrders] = await Promise.all([
         search("artist", []),
         search("uploaded_image", [
           { key: "use_new_system", constraint_type: "equals", value: true },
           { key: "Pending", constraint_type: "equals", value: true }]),
         search("edit_request", [{ key: "Completed", constraint_type: "is_empty" }]),
+        search("uploaded_image", [
+          { key: "use_new_system", constraint_type: "equals", value: true },
+          { key: F.claimState, constraint_type: "equals", value: "needs_review" }]),
       ]);
+      // Merge review orders (Pending=false, so absent from the pending query) into the list.
+      const seen = new Set(pendingRaw.map((o) => o._id));
+      const pending = pendingRaw.concat((reviewOrders || []).filter((o) => !seen.has(o._id)));
       const now = Date.now();
       // edit_request has no use_new_system flag; keep only edits whose order is a new-system
       // order. Edits reopen the order to Pending=true, so a new-system edit's order is always
@@ -1119,6 +1282,7 @@ function mountVendorPortal(app, deps) {
       // pre-stamps nothing now (shared pool), but legacy rows may still carry a stamp;
       // claim_state is the only source of truth for "claimed".
       const isClaimed = (o) => (o[F.claimState] || "") === "claimed";
+      const inReview = (o) => (o[F.claimState] || "") === "needs_review";
       const orders = pending.map((o) => {
         const created = o["Created Date"] ? (now - new Date(o["Created Date"]).getTime()) / 3600000 : null;
         const claimed = (isClaimed(o) && o.claimed_at) ? (now - new Date(o.claimed_at).getTime()) / 3600000 : null;
@@ -1126,7 +1290,8 @@ function mountVendorPortal(app, deps) {
         return {
           id: o._id, orderNo: o["Order#"] || "", ref: o["Customer_PO#"] || "", type: o.Order_Type || "",
           user: o.User || "", teamId: o.Team_Name || "", state: o[F.claimState] || "",
-          assigned: isClaimed(o) ? String(o[F.assignedArtist] || "") : "",
+          // Review orders keep their assigned artist visible so the reviewer knows who to reject to.
+          assigned: (isClaimed(o) || inReview(o)) ? String(o[F.assignedArtist] || "") : "",
           reqCaps: requiredCapsFor(o),
           thumb: o.image ? (String(o.image).startsWith("//") ? "https:" + o.image : String(o.image)) : "",
           createdHours: created != null ? +created.toFixed(2) : null,
@@ -1134,6 +1299,9 @@ function mountVendorPortal(app, deps) {
           separations: o[F.separations] || "no", rush: o.Rush || "no",
           multiEdit: o["Multiple Edit Alert"] === true,
           hasEdit: !!edit, edit: edit,
+          inReview: inReview(o),
+          reviewReasons: inReview(o) ? String(o.review_reasons || "") : "",
+          reviewPreview: inReview(o) ? String(o.review_preview || "") : "",
         };
       }).sort((a, b) => {
         const av = a.claimedHours != null ? a.claimedHours : -1, bv = b.claimedHours != null ? b.claimedHours : -1;
@@ -1152,6 +1320,7 @@ function mountVendorPortal(app, deps) {
           return c != null && c > 3;
         }).length,
         multiEdit: pending.filter((o) => o["Multiple Edit Alert"] === true).length,
+        needsReview: pending.filter((o) => inReview(o)).length,
         vector: pending.filter((o) => o.Order_Type === "Vector").length,
         digitizing: pending.filter((o) => o.Order_Type === "Digitizing").length,
         digital: pending.filter((o) => o.Order_Type === "Digital (DTF/DTG)").length,
@@ -1736,6 +1905,17 @@ header a{color:#93c5fd;text-decoration:none;margin-left:14px;font-size:14px}
 .kpi.good{background:#f0fdf4;border-color:#bbf7d0}.kpi.good .kn{color:#16a34a}.kpi.good .kl{color:#15803d}
 .kpi.clickk{cursor:pointer}.kpi.clickk:hover{filter:brightness(.98)}
 .mini.m-editreq{background:#fde68a;color:#92400e}
+.mini.m-review{background:#fecaca;color:#991b1b}
+.reviewbox{margin:10px 0;padding:12px 14px;background:#fef2f2;border:1px solid #fecaca;border-radius:8px}
+.reviewbox .tmpl-label{color:#991b1b}
+.rvlist{margin:6px 0;padding-left:18px;font-size:13px;color:#7f1d1d}
+.rvlist li{margin:2px 0}
+.rvprev{display:block;max-width:100%;border:1px solid #e5e7eb;border-radius:6px;margin:8px 0;background:#fff}
+.rvactions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.rvapprove{background:#16a34a;color:#fff;border:0;border-radius:8px;padding:8px 14px;font-size:13px;font-weight:600;cursor:pointer}
+.rvapprove:hover{background:#15803d}
+.rvreject{background:#fff;color:#b91c1c;border:1px solid #fecaca;border-radius:8px;padding:8px 14px;font-size:13px;font-weight:600;cursor:pointer}
+.rvreject:hover{background:#fef2f2}
 .chiprow{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}
 .chip2{font-size:12px;background:#f1f5f9;color:#475569;padding:5px 11px;border-radius:999px}.chip2 b{color:#0f172a;font-weight:700}
 .chip2.click{cursor:pointer}.chip2.click:hover{filter:brightness(.97)}
@@ -1857,7 +2037,7 @@ table.stats td.g,table.stats td.o,table.stats td.r{font-weight:700}.g{color:#16a
 <div id=panel></div>
 <script>
 let DATA={vendors:[],orders:[],artists:[],totals:{}},byId={},panelOpenId=null;
-let sortBy='placed',fltVendor='',fltState='',fltType='',fltMulti=false,fltEdit=false,fltSearch='',fltClient='';
+let sortBy='placed',fltVendor='',fltState='',fltType='',fltMulti=false,fltEdit=false,fltSearch='',fltClient='',fltReview=false;
 function fmtH(h){if(h==null)return '\\u2013';if(h>=48)return (h/24).toFixed(1)+'d';return h+'h';}
 function completionClass(h){if(h==null)return 't-green';if(h>14)return 't-red';if(h>=6)return 't-orange';return 't-green';}
 function claimAgeClass(h){if(h==null)return 't-green';if(h>3)return 't-red';if(h>=1.5)return 't-orange';return 't-green';}
@@ -1900,6 +2080,7 @@ function renderKpis(){
     kpi(v(t.unassigned),'Unassigned',t.unassigned?'alert':'')+
     kpi(v(t.pending),'Pending')+
     kpi(v(t.openEdits),'Edits pending','',t.openEdits?'filterEdits()':'')+
+    kpi(v(t.needsReview),'Needs review',t.needsReview?'alert':'',t.needsReview?'filterReview()':'')+
     kpi(oldestStr,'Oldest unclaimed')+
     kpi(v(t.completedToday),'Done today')+
     kpi(v(t.editsToday),'Edits today')+
@@ -1924,10 +2105,12 @@ function populateFilters(){
   csel.innerHTML='<option value="">All</option>'+clients.map(function(c){return '<option value="'+esc(c)+'">'+esc(c)+'</option>';}).join('');csel.value=curc;
 }
 function setSort(v){sortBy=v;renderList();}
-function setFilter(){fltVendor=document.getElementById('fVendor').value;fltState=document.getElementById('fState').value;fltType=document.getElementById('fType').value;fltMulti=document.getElementById('fMulti').checked;fltEdit=document.getElementById('fEdit').checked;fltSearch=document.getElementById('fSearch').value.trim().toLowerCase();fltClient=document.getElementById('fClient').value;renderList();}
+function setFilter(){fltReview=false;fltVendor=document.getElementById('fVendor').value;fltState=document.getElementById('fState').value;fltType=document.getElementById('fType').value;fltMulti=document.getElementById('fMulti').checked;fltEdit=document.getElementById('fEdit').checked;fltSearch=document.getElementById('fSearch').value.trim().toLowerCase();fltClient=document.getElementById('fClient').value;renderList();}
 function filterMulti(){document.getElementById('fMulti').checked=true;showTab('orders');setFilter();}
 function filterEdits(){document.getElementById('fEdit').checked=true;showTab('orders');setFilter();}
+function filterReview(){fltReview=true;showTab('orders');renderList();}
 function applyFilter(arr){return arr.filter(function(o){
+  if(fltReview)return o.inReview;
   if(fltVendor&&o.assigned!==fltVendor)return false;
   if(fltClient&&(o.clientEmail||'')!==fltClient)return false;
   if(fltState==='unassigned'&&o.assigned)return false;
@@ -1952,7 +2135,7 @@ function renderList(){
 function rowHtml(o){
   var thumb=o.thumb?'<img class=rthumb src="'+o.thumb+'" onerror="this.outerHTML=phThumb()">':phThumb();
   var assigned=o.assigned?esc(shortUser(o.assigned)):'<span class="mini m-un">Unassigned</span>';
-  var marks=(o.unread?'<span class="mini msgnew">\\uD83D\\uDCAC New</span>':'')+(o.hasEdit?'<span class="mini m-editreq">\\u270E Edit</span>':'')+(o.separations==='yes'?'<span class="mini m-sep">Sep</span>':'')+(o.rush==='yes'?'<span class="mini m-rush">Rush</span>':'')+(o.multiEdit?'<span class="mini m-multi">\\u26A0 Multi-edit</span>':'');
+  var marks=(o.unread?'<span class="mini msgnew">\\uD83D\\uDCAC New</span>':'')+(o.inReview?'<span class="mini m-review">\\u26A0 Review</span>':'')+(o.hasEdit?'<span class="mini m-editreq">\\u270E Edit</span>':'')+(o.separations==='yes'?'<span class="mini m-sep">Sep</span>':'')+(o.rush==='yes'?'<span class="mini m-rush">Rush</span>':'')+(o.multiEdit?'<span class="mini m-multi">\\u26A0 Multi-edit</span>':'');
   var pill=(o.claimedHours!=null)
     ? '<div class="timer '+completionClass(o.claimedHours)+'" title="Time held since claimed">'+fmtH(o.claimedHours)+'</div>'
     : '<div class="timer '+claimAgeClass(o.createdHours)+'" title="Unclaimed \\u2014 time since placed">\\u231B '+fmtH(o.createdHours)+'</div>';
@@ -2120,8 +2303,21 @@ function fillPanel(o){
       (refs?'<div class=specline><b>References:</b> '+refs+'</div>':'')+
       faultBoxHtml(er)+'</div>';
   }
+  var reviewBox='';
+  if(o.inReview){
+    var reasons=(o.reviewReasons||'').split(' | ').filter(function(x){return x;});
+    var rlist=reasons.length?('<ul class=rvlist>'+reasons.map(function(x){return '<li>'+esc(x)+'</li>';}).join('')+'</ul>'):'<div class=specline>Flagged for manual review.</div>';
+    var prev=o.reviewPreview?('<img src="'+esc(o.reviewPreview)+'" class=rvprev alt="stitch preview">'):'';
+    reviewBox='<div class=reviewbox><div class=tmpl-label>\\u26A0 Flagged by automated QA</div>'+
+      (o.assigned?'<div class=specline><b>Vendor:</b> '+esc(shortUser(o.assigned))+'</div>':'')+
+      rlist+prev+
+      '<div class=rvactions>'+
+      '<button class=rvapprove onclick="reviewApprove(\\''+o.id+'\\')">\\u2713 Approve &amp; complete</button>'+
+      '<button class=rvreject onclick="reviewReject(\\''+o.id+'\\')">\\u2717 Reject with notes</button>'+
+      '</div><div id=rvMsg class=faultmsg></div></div>';
+  }
   panel.innerHTML='<div class=phead><div><div class=ptitle>Order '+esc(o.orderNo||o.id)+'</div><div class=peyebrow>'+esc(o.type||'')+(o.ref?' \\u00b7 PO '+esc(o.ref):'')+'</div></div><button class=pclose onclick="closeDetail()">\\u2715</button></div>'+
-    '<div class=pbody>'+multi+'<div>'+badges+'</div>'+thumb+editReq+
+    '<div class=pbody>'+multi+'<div>'+badges+'</div>'+thumb+reviewBox+editReq+
     '<div class=specline><b>Client:</b> '+esc(o.clientEmail||o.user||'?')+'</div>'+
     '<div class=specline><b>Team:</b> '+esc(o.teamName||'\\u2013')+'</div>'+statusBlock+
     '<div class=specline><b>Created:</b> '+(o.createdHours!=null?fmtH(o.createdHours)+' ago':'\\u2013')+'</div>'+
@@ -2154,6 +2350,27 @@ function cancelOrder(id){
   if(!confirm('Cancel this order? It stops rotating and leaves all queues.'))return;
   var msg=document.getElementById('pmsg');msg.textContent='Cancelling\\u2026';msg.style.color='#64748b';
   fetch('/vendor/api/admin/cancel-order',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})}).then(function(r){return r.json();}).then(function(j){if(j.ok){closeDetail();}else{msg.textContent='Error: '+(j.error||'failed');msg.style.color='#dc2626';}});
+}
+async function reviewApprove(id){
+  if(!confirm('Approve this order and mark it complete? The client will be emailed that it is ready.'))return;
+  var m=document.getElementById('rvMsg');if(m){m.style.color='#64748b';m.textContent='Approving\\u2026';}
+  try{
+    const r=await fetch('/vendor/api/admin/review-approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})});
+    const j=await r.json();
+    if(j.ok){closeDetail();load();}else if(m){m.style.color='#dc2626';m.textContent=j.error||'Failed';}
+  }catch(e){if(m){m.style.color='#dc2626';m.textContent='Failed';}}
+}
+async function reviewReject(id){
+  var notes=prompt('Reject and send back to the vendor. Enter notes explaining what to fix:');
+  if(notes==null)return;
+  notes=notes.trim();
+  if(!notes){alert('Notes are required to reject.');return;}
+  var m=document.getElementById('rvMsg');if(m){m.style.color='#64748b';m.textContent='Rejecting\\u2026';}
+  try{
+    const r=await fetch('/vendor/api/admin/review-reject',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id,notes:notes})});
+    const j=await r.json();
+    if(j.ok){closeDetail();load();}else if(m){m.style.color='#dc2626';m.textContent=j.error||'Failed';}
+  }catch(e){if(m){m.style.color='#dc2626';m.textContent='Failed';}}
 }
 async function logout(){await fetch('/vendor/api/logout',{method:'POST'});location.href='/vendor/login';}
 load();
