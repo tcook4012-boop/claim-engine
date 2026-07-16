@@ -85,80 +85,32 @@ const orderSpeedHours = (o) => {
 };
 const completedAtMs = (o) => { const fc = firstCompletedOf(o); return fc ? new Date(fc).getTime() : null; };
 
-/* ---- Edit fault classification ----------------------------------------------
-   An edit exists either because WE got it wrong (vendor_error) or because the client
-   wanted something different from what they originally asked for (client_change).
-   Vendors dispute this constantly, so the data model separates the two ideas:
+/* ---- Edit fault classification (minimal) ------------------------------------
+   An edit is either OUR mistake (vendor_error) or the client wanting something
+   different (client_change), or unclear. Claude labels every new edit automatically;
+   the label is the number. A human can override, which LOCKS the row so the
+   classifier never touches it again.
 
-     Edit_Reason  (existing, CLIENT-selected)  = WHAT changed.  Unreliable as fault.
-     edit_fault   (new, EFFECTIVE fault)        = WHO is at fault. What the metrics read.
-     ai_fault     (new, Claude's raw call)      = kept separately so the prompt can be scored.
-     fault_set_by (new)                         = "claude:<model>:<version>" or an admin email.
-
-   There is no review queue: Claude's call is ADOPTED as edit_fault automatically. A human
-   may override any row, and once they do the classifier never touches it again. Claude
-   cannot be fine-tuned here -- you iterate the PROMPT. Bump FAULT_PROMPT_VERSION to
-   re-classify; agreement against the rows a human did label by hand is the score.
-
-   Guardrail: a suggestion below AUTO_ADOPT_MIN confidence is adopted as "unclear" rather
-   than as a guess. An unreviewed classifier should never blame a vendor it isn't sure of. */
+   Config (model, confidence floor, the prompt itself) lives in ./fault-prompt.js.
+   Only TWO fields are stored per edit:
+     edit_fault    (text)   vendor_error | client_change | unclear
+     fault_locked  (yes/no) a human set it; the classifier must not overwrite. */
+const { FAULT_MODEL, FAULT_CONFIDENCE_FLOOR, FAULT_CODES, FAULT_PROMPT } = require("./fault-prompt");
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || "";
-// Pinned snapshot, not an alias: aliases move under you. Override via env to A/B a model.
-const FAULT_MODEL = process.env.FAULT_MODEL || "claude-haiku-4-5-20251001";
-const FAULT_PROMPT_VERSION = process.env.FAULT_PROMPT_VERSION || "v1";
-const AUTO_ADOPT_MIN = Number(process.env.FAULT_AUTO_ADOPT_MIN || 0.7);
-const AUTO_CLASSIFY_MIN = Number(process.env.FAULT_AUTO_CLASSIFY_MIN || 30); // background sweep
-// Sized for real throughput: ~1,000 edits/month is ~1.4/hour. 25 every 15 min = 100/hour, so
-// the queue stays empty and most sweeps cost one Bubble call that finds nothing.
+const AUTO_CLASSIFY_MIN = Number(process.env.FAULT_AUTO_CLASSIFY_MIN || 30);
 const SWEEP_BATCH = Math.min(Math.max(Number(process.env.FAULT_SWEEP_BATCH || 25), 1), 100);
-// Global fallback idle threshold (hours) -- must match app.js IDLE_DEFAULT_HOURS. Used for
-// the admin display and the vendor-controls grid placeholder; the ENGINE reads its own copy.
-const IDLE_DEFAULT_HOURS = Number(process.env.IDLE_DEFAULT_HOURS || 5);
-/* FORWARD-ONLY. Without a cutoff, "ai_prompt_version is_empty" matches every edit ever
-   written, and the sweep would grind through the entire back catalogue -- burning Bubble
-   workflow units to label history nobody asked for. Pin FAULT_START_DATE (e.g. 2026-07-08)
-   so the boundary survives redeploys; otherwise we fall back to boot time, which silently
-   skips any edit created between the last restart and this one. */
 const FAULT_START_ISO = (() => {
   const raw = process.env.FAULT_START_DATE;
   if (raw) { const d = new Date(raw); if (!isNaN(d)) return d.toISOString();
-    console.warn(`[fault] FAULT_START_DATE="${raw}" is not a valid date -- falling back to boot time`); }
-  else console.warn("[fault] FAULT_START_DATE not set -- classifying edits created after THIS BOOT. Pin it to survive redeploys.");
+    console.warn(`[fault] FAULT_START_DATE="${raw}" invalid -- using boot time`); }
+  else console.warn("[fault] FAULT_START_DATE not set -- classifying edits after THIS BOOT. Pin it to survive redeploys.");
   return new Date().toISOString();
 })();
-const FAULT_CODES = ["vendor_error", "client_change", "unclear"];
-const isHumanSetter = (v) => !!v && !String(v).startsWith("claude:");
-
-const FAULT_RUBRIC = [
-  "You classify edit requests for a print-art preparation business (vector art, embroidery digitizing, DTF/DTG).",
-  "Decide whether the edit exists because the VENDOR made a mistake, or because the CLIENT wants something different from what they originally asked for.",
-  "",
-  "vendor_error - the delivered artwork does not match the client's ORIGINAL instructions:",
-  "  stated directions not followed; a typo the vendor introduced; dimensions, stitch count or colors that contradict the order spec; a requested element missing; poor execution quality.",
-  "client_change - the client asks for something that was NOT in the original instructions, or reverses what they originally asked for:",
-  "  a new color, a new size, an added or removed element, a change of mind, or the client having supplied the wrong file or wrong spelling in the first place.",
-  "unclear - the evidence is genuinely insufficient to tell.",
-  "",
-  "Rules:",
-  "- Compare CHANGES_REQUESTED against ORIGINAL_INSTRUCTIONS. If the change adds a requirement that was never stated, it is client_change.",
-  "- A misspelling is vendor_error ONLY if the correct spelling was available in the original instructions or artwork. If the client supplied the misspelling, it is client_change.",
-  "- CLIENT_SELECTED_REASON is chosen by the client and is unreliable. Weak evidence only; never decide on it alone.",
-  "- Do not favor either party. Prefer unclear over guessing.",
-  "",
-  'Output JSON only. No prose, no markdown fences: {"fault":"vendor_error|client_change|unclear","confidence":0.0-1.0,"rationale":"<=200 chars"}',
-].join("\n");
-
-// Read tolerantly (Bubble editor labels != API keys) and normalize.
 const readField = (r, ...keys) => { for (const k of keys) { const v = r && r[k]; if (v !== undefined && v !== null && v !== "") return v; } return null; };
 const normFault = (v) => { const f = String(v || "").toLowerCase().trim(); return FAULT_CODES.includes(f) ? f : null; };
-// SOURCE OF TRUTH for every metric: the human call, and only the human call.
 const faultOf = (er) => normFault(readField(er, "edit_fault", "Edit_Fault"));
-const aiFaultOf = (er) => normFault(readField(er, "ai_fault", "AI_Fault"));
-const aiVersionOf = (er) => readField(er, "ai_prompt_version", "AI_Prompt_Version");
-const setterOf = (er) => readField(er, "fault_set_by", "Fault_Set_By") || "";
+const isLocked = (er) => { const v = readField(er, "fault_locked", "Fault_Locked"); return v === true || v === "yes" || v === "true"; };
 
-/* Ask Claude for a fault suggestion. Returns {ok,fault,confidence,rationale} and NEVER
-   throws into the caller's flow -- a classifier outage must not break the dashboard. */
 async function classifyEditFault(er, order) {
   if (!ANTHROPIC_KEY) return { ok: false, error: "ANTHROPIC_API_KEY not set" };
   const payload = {
@@ -171,23 +123,20 @@ async function classifyEditFault(er, order) {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
-      body: JSON.stringify({
-        model: FAULT_MODEL, max_tokens: 300, system: FAULT_RUBRIC,
-        messages: [{ role: "user", content: JSON.stringify(payload) }],
-      }),
+      body: JSON.stringify({ model: FAULT_MODEL, max_tokens: 150, system: FAULT_PROMPT, messages: [{ role: "user", content: JSON.stringify(payload) }] }),
     });
-    if (!res.ok) return { ok: false, error: `Claude ${res.status}: ${(await res.text()).slice(0, 200)}` };
+    if (!res.ok) return { ok: false, error: `Claude ${res.status}: ${(await res.text()).slice(0, 160)}` };
     const data = await res.json();
     const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("").trim();
     const clean = text.replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
-    let parsed; try { parsed = JSON.parse(clean); } catch (_) { return { ok: false, error: "model did not return JSON: " + clean.slice(0, 120) }; }
+    let parsed; try { parsed = JSON.parse(clean); } catch (_) { return { ok: false, error: "bad JSON: " + clean.slice(0, 100) }; }
     const fault = normFault(parsed.fault);
-    if (!fault) return { ok: false, error: "model returned an unknown fault code" };
-    let conf = Number(parsed.confidence);
-    if (!(conf >= 0 && conf <= 1)) conf = 0;
-    return { ok: true, fault, confidence: +conf.toFixed(2), rationale: String(parsed.rationale || "").slice(0, 300) };
+    if (!fault) return { ok: false, error: "unknown fault code" };
+    let conf = Number(parsed.confidence); if (!(conf >= 0 && conf <= 1)) conf = 0;
+    return { ok: true, fault: conf >= FAULT_CONFIDENCE_FLOOR ? fault : "unclear" };
   } catch (e) { return { ok: false, error: e.message }; }
 }
+
 
 function newSession(data) {
   const token = makeToken();
@@ -1268,12 +1217,8 @@ function mountVendorPortal(app, deps) {
           id: er._id,
           changes: er.Changes_Needed || "", reason: er.Edit_Reason || "",
           artist: er.Assigned_Artist || "", created: er["Created Date"] || null,
-          // Fault: the human call (authoritative) and Claude's suggestion (advisory).
-          fault: faultOf(er), faultSetBy: readField(er, "fault_set_by", "Fault_Set_By") || "",
-          aiFault: aiFaultOf(er),
-          aiConfidence: readField(er, "ai_confidence", "AI_Confidence"),
-          aiRationale: readField(er, "ai_rationale", "AI_Rationale") || "",
-          aiVersion: aiVersionOf(er) || "",
+          // Two fields only: the answer, and whether a human locked it.
+          fault: faultOf(er), locked: isLocked(er),
           refs: [["Reference 1", er.File_1], ["Reference 2", er.File_2]]
             .map(([label, v]) => { const u = linkifyD(v); return u ? { label, url: u } : null; }).filter(Boolean),
         };
@@ -1492,166 +1437,99 @@ function mountVendorPortal(app, deps) {
     const { response } = await bubble("GET", `/${type}?${q}`);
     return { rows: response.results || [], remaining: response.remaining || 0 };
   }
-  // Rows the classifier still owes work on. A row with ANY ai_prompt_version -- including
-  // "v1:error" -- is excluded, so a prompt-breaking record can't poison the queue forever.
-  // Both are bounded by FAULT_START_ISO: history is never touched, by either mode.
-  let _faultStats = null; // declared ahead of every writer/reader below (no TDZ surprises)
-  const SINCE_CUTOFF = { key: "Created Date", constraint_type: "greater than", value: FAULT_START_ISO };
-  const NEEDS_CLASSIFY = [SINCE_CUTOFF, { key: "ai_prompt_version", constraint_type: "is_empty" }];
-  const STALE_VERSION = [SINCE_CUTOFF, { key: "ai_prompt_version", constraint_type: "not equal", value: FAULT_PROMPT_VERSION }];
 
-  /* ---- Edit fault: human adjudication + Claude suggestions -------------------
-     Division of labour, deliberately: /set-fault writes edit_fault (the number-bearing
-     truth, always a human). /classify-* write ONLY ai_* fields. Nothing here ever lets
-     the model set a value that caps a vendor's workload. */
+  /* ---- Edit fault: auto-classify + human override ---------------------------
+     Two fields stored: edit_fault (answer) and fault_locked (a human set it). Config in
+     ./fault-prompt.js. Forward-only: nothing before FAULT_START_ISO is ever classified. */
+  const NEEDS_CLASSIFY = [
+    { key: "Created Date", constraint_type: "greater than", value: FAULT_START_ISO },
+    { key: "edit_fault", constraint_type: "is_empty" },
+  ];
+  const RECLASSIFY = [
+    { key: "Created Date", constraint_type: "greater than", value: FAULT_START_ISO },
+    { key: "fault_locked", constraint_type: "is_empty" },
+  ];
+  let _faultStats = null;
+
   app.post("/vendor/api/admin/set-fault", express.json(), requireAdminLogin, async (req, res) => {
     try {
       const editId = String(req.body.editId || "");
       const fault = normFault(req.body.fault);
       if (!editId || !fault) return res.status(400).json({ ok: false, error: "editId and a valid fault are required" });
-      // Writing a human's email into fault_set_by makes this row human-owned: the
-      // background classifier will never overwrite it again (see suggestFault).
-      await bubble("PATCH", `/edit_request/${editId}`, {
-        edit_fault: fault,
-        fault_set_by: req.session.email || "admin",
-        fault_set_at: Date.now(),
-      });
-      _faultStats = null; // a human label changes both the counts and the accuracy score
+      await bubble("PATCH", `/edit_request/${editId}`, { edit_fault: fault, fault_locked: "yes" });
+      _faultStats = null;
       res.json({ ok: true, fault });
     } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
   });
 
-  // Classify one edit and ADOPT the answer as the effective fault.
-  // Never overwrites a row a human has already touched.
-  async function suggestFault(er) {
+  async function classifyOne(er) {
+    if (isLocked(er)) return { ok: true, skipped: true };
     let order = null;
     try { const m = await search("uploaded_image", [{ key: "Order#", constraint_type: "equals", value: er["Order#"] }]); order = m[0] || null; }
     catch (e) { console.warn("[fault] order lookup failed:", e.message); }
     const r = await classifyEditFault(er, order);
-    if (!r.ok) {
-      // Distinguish a misbehaving MODEL (bad JSON / unknown code -> will fail again on the
-      // same input) from a transient outage (5xx, network -> retry next sweep). Only the
-      // former gets marked, or one poison record blocks the head of the queue forever.
-      const permanent = /did not return JSON|unknown fault code/.test(r.error || "");
-      if (permanent) {
-        try { await bubble("PATCH", `/edit_request/${er._id}`, { ai_prompt_version: `${FAULT_PROMPT_VERSION}:error`, ai_rationale: String(r.error).slice(0, 300) }); }
-        catch (_) {}
-      }
-      return r;
-    }
-    // Below the confidence floor we adopt "unclear" rather than a guess: an unreviewed
-    // classifier must not blame a vendor it isn't sure about. ai_fault keeps the raw call.
-    const adopted = r.confidence >= AUTO_ADOPT_MIN ? r.fault : "unclear";
-    const patch = {
-      ai_fault: r.fault, ai_confidence: r.confidence, ai_rationale: r.rationale,
-      ai_prompt_version: FAULT_PROMPT_VERSION, ai_model: FAULT_MODEL, ai_classified_at: Date.now(),
-    };
-    const humanOwned = isHumanSetter(setterOf(er));
-    if (!humanOwned) {
-      patch.edit_fault = adopted;
-      patch.fault_set_by = `claude:${FAULT_MODEL}:${FAULT_PROMPT_VERSION}`;
-      patch.fault_set_at = Date.now();
-    }
-    try { await bubble("PATCH", `/edit_request/${er._id}`, patch); }
+    if (!r.ok) return r;
+    try { await bubble("PATCH", `/edit_request/${er._id}`, { edit_fault: r.fault }); }
     catch (e) { return { ok: false, error: "classified but could not save: " + e.message }; }
-    _faultStats = null; // counts changed
-    return { ...r, adopted, humanOwned };
+    _faultStats = null;
+    return r;
   }
 
-  app.post("/vendor/api/admin/classify-edit", express.json(), requireAdminLogin, async (req, res) => {
-    try {
-      const editId = String(req.body.editId || "");
-      if (!editId) return res.status(400).json({ ok: false, error: "editId required" });
-      const er = await bubble("GET", `/edit_request/${editId}`).then((r) => r.response);
-      if (!er) return res.status(404).json({ ok: false, error: "Edit request not found" });
-      const r = await suggestFault(er);
-      return r.ok ? res.json({ ok: true, ...r }) : res.status(502).json({ ok: false, error: r.error });
-    } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
-  });
-
-  /* Batch: classify edits that have no suggestion, or whose suggestion came from an older
-     prompt version. Bumping FAULT_PROMPT_VERSION therefore re-runs everything -- that is
-     how you iterate a prompt and then score it against the human labels. Serial on purpose:
-     these are small requests and we would rather be slow than rate-limited. */
-  /* mode "new" (default): rows never classified. mode "reclassify": rows carrying an older
-     prompt version -- used deliberately after bumping FAULT_PROMPT_VERSION, never automatically,
-     because auto-rerunning a whole history is a surprise nobody wants. Both are a single
-     constrained page, so cost does not grow with table size. */
   app.post("/vendor/api/admin/classify-batch", express.json(), requireAdminLogin, async (req, res) => {
     if (!ANTHROPIC_KEY) return res.status(400).json({ ok: false, error: "ANTHROPIC_API_KEY not set on this service" });
-    const limit = Math.min(Math.max(Number(req.body.limit) || 10, 1), 50);
-    const constraints = req.body.mode === "reclassify" ? STALE_VERSION : NEEDS_CLASSIFY;
+    const limit = Math.min(Math.max(Number(req.body.limit) || 25, 1), 50);
+    const constraints = req.body.mode === "reclassify" ? RECLASSIFY : NEEDS_CLASSIFY;
     try {
       const page = await searchPage("edit_request", constraints, limit);
       let done = 0; const errors = [];
       for (const er of page.rows) {
-        const r = await suggestFault(er);
-        if (r.ok) done++; else errors.push(`${er["Order#"] || er._id}: ${r.error}`);
+        const r = await classifyOne(er);
+        if (r.ok) { if (!r.skipped) done++; } else errors.push(`${er["Order#"] || er._id}: ${r.error}`);
       }
       res.json({ ok: true, classified: done, attempted: page.rows.length, remaining: page.remaining, errors: errors.slice(0, 5) });
     } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
   });
 
-  /* The feedback loop's scoreboard: how much is adjudicated, and how often Claude agreed
-     with the human on the edits where both exist. That agreement number IS the eval --
-     change the prompt, bump the version, re-classify, watch it move. */
-  /* Scoped to a rolling window and cached: the admin board polls every 30s, and an
-     all-time scan of edit_request would be ~120 Bubble calls a pop. */
   const FAULT_STATS_TTL = 15 * 60 * 1000;
   const FAULT_STATS_DAYS = 30;
   app.get("/vendor/api/admin/fault-stats", requireAdminLogin, async (_req, res) => {
     if (_faultStats && Date.now() - _faultStats.at < FAULT_STATS_TTL) return res.json(_faultStats.body);
     try {
-      // Whichever is LATER: the go-live cutoff, or 30 days back. Keeps the scan small
-      // forever instead of growing with the table.
       const win = new Date(Date.now() - FAULT_STATS_DAYS * 86400000).toISOString();
       const since = win > FAULT_START_ISO ? win : FAULT_START_ISO;
       const all = await search("edit_request", [{ key: "Created Date", constraint_type: "greater than", value: since }]);
       const labelled = all.filter((er) => faultOf(er));
-      // CRITICAL: agreement is measured ONLY on rows a HUMAN labelled. Claude auto-adopts
-      // its own call into edit_fault, so comparing against those rows would trivially
-      // report 100% and tell you nothing about whether the prompt is any good.
-      const humanRows = all.filter((er) => isHumanSetter(setterOf(er)) && faultOf(er));
-      const scorable = humanRows.filter((er) => aiFaultOf(er));
-      const agree = scorable.filter((er) => aiFaultOf(er) === faultOf(er)).length;
       const byCode = {};
       FAULT_CODES.forEach((c) => { byCode[c] = labelled.filter((er) => faultOf(er) === c).length; });
       const body = {
-        ok: true, windowDays: FAULT_STATS_DAYS, since, startedAt: FAULT_START_ISO,
+        ok: true, windowDays: FAULT_STATS_DAYS, startedAt: FAULT_START_ISO,
         total: all.length, labelled: labelled.length,
-        autoLabelled: labelled.length - humanRows.length, humanLabelled: humanRows.length,
-        unclassified: all.filter((er) => !aiVersionOf(er)).length,
-        errored: all.filter((er) => String(aiVersionOf(er) || "").endsWith(":error")).length,
-        compared: scorable.length, agreement: scorable.length ? +((agree / scorable.length) * 100).toFixed(1) : null,
-        promptVersion: FAULT_PROMPT_VERSION, model: FAULT_MODEL, keyPresent: !!ANTHROPIC_KEY,
-        autoAdoptMin: AUTO_ADOPT_MIN, byCode,
+        locked: all.filter((er) => isLocked(er)).length,
+        pending: all.filter((er) => !faultOf(er)).length,
+        model: FAULT_MODEL, keyPresent: !!ANTHROPIC_KEY, byCode,
       };
       _faultStats = { at: Date.now(), body };
       res.json(body);
     } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
   });
 
-  /* Background auto-classifier. No review queue exists, so nothing may depend on a human
-     pressing a button: every FAULT_AUTO_CLASSIFY_MIN minutes we classify a small batch of
-     edits that have no suggestion (or carry a stale prompt version). Serial and capped, so
-     a backlog drains gradually instead of stampeding the API. Failures are logged only. */
   async function autoClassifySweep() {
     if (!ANTHROPIC_KEY) return;
     try {
-      // ONE constrained Bubble call, regardless of how big edit_request grows.
       const { rows, remaining } = await searchPage("edit_request", NEEDS_CLASSIFY, SWEEP_BATCH);
       if (!rows.length) return;
       let ok = 0;
-      for (const er of rows) { const r = await suggestFault(er); if (r.ok) ok++; }
-      console.log(`[fault-sweep] classified ${ok}/${rows.length} edit(s) with ${FAULT_MODEL} (${FAULT_PROMPT_VERSION}); ${remaining} waiting`);
+      for (const er of rows) { const r = await classifyOne(er); if (r.ok && !r.skipped) ok++; }
+      console.log(`[fault-sweep] classified ${ok}/${rows.length} edit(s) with ${FAULT_MODEL}; ${remaining} waiting`);
     } catch (e) { console.warn("[fault-sweep] failed:", e.message); }
   }
   if (ANTHROPIC_KEY) {
-    setTimeout(autoClassifySweep, 30 * 1000);                       // once shortly after boot
-    setInterval(autoClassifySweep, AUTO_CLASSIFY_MIN * 60 * 1000);  // then on a slow cadence
+    setTimeout(autoClassifySweep, 30 * 1000);
+    setInterval(autoClassifySweep, AUTO_CLASSIFY_MIN * 60 * 1000);
   } else {
     console.warn("[fault] ANTHROPIC_API_KEY not set -- edit fault classification is off");
   }
+
 
   // TEMP diagnostic: surfaces exactly why completion mail might not send.
   //   /vendor/api/admin/email-test                       -> is the key present? what's the From?
@@ -2189,26 +2067,23 @@ function eligibleFor(o){
     return {email:a.email,contact:a.contact,load:load,cap:cap,bucket:(dig?'digitizing':'other'),under:(cap!=null&&load<cap)};
   });
 }
-// Scoreboard for the fault-classification loop. Agreement% = how often Claude's
-// suggestion matched the human call, on edits where both exist. Change the prompt,
-// bump FAULT_PROMPT_VERSION, re-classify, and watch this number move.
+// Small fault scoreboard. Auto-classifies in the background; a human override locks a row.
+// After editing fault-prompt.js, use "Re-classify" to re-run every unlocked edit.
 async function renderFaultBar(){
   var el=document.getElementById('faultbar');if(!el)return;
   try{
     const r=await fetch('/vendor/api/admin/fault-stats');const d=await r.json();
     if(!d.ok){el.innerHTML='';return;}
-    var agree=(d.agreement!=null)?(d.agreement+'%'):'\\u2013';
-    var n=(d.unclassified>25?25:d.unclassified);
+    var n=(d.pending>25?25:d.pending);
     var btn=d.keyPresent?'<button class=faultai onclick="classifyBatch()">\\u2728 Classify '+n+' now</button>':'<span class=faultby>ANTHROPIC_API_KEY not set</span>';
+    var codes=d.byCode||{};
     el.innerHTML='<div class=faultbar><b>Edit fault</b>'+
       '<span class=fbstat title="Rolling '+d.windowDays+'-day window. Edits before go-live are never classified.">'+d.labelled+' / '+d.total+' classified</span>'+
-      '<span class=fbstat title="Classification is forward-only from this date (FAULT_START_DATE).">since '+shortDate(d.startedAt)+'</span>'+
-      '<span class=fbstat title="Rows a human labelled by hand. Only these can score the prompt.">'+d.humanLabelled+' human-checked</span>'+
-      '<span class=fbstat title="How often Claude matched the human on hand-checked rows. This is the prompt\\'s accuracy score.">accuracy '+agree+(d.compared?' (n='+d.compared+')':'')+'</span>'+
-      (d.unclassified?'<span class=fbstat>'+d.unclassified+' pending</span>':'')+
-      (d.errored?'<span class=fbstat style=color:#b91c1c>'+d.errored+' errored</span>':'')+
-      '<span class=fbstat title="Bump FAULT_PROMPT_VERSION, then re-classify deliberately. It never reruns your history on its own.">prompt '+esc(d.promptVersion)+'</span>'+
-      (d.unclassified?btn:'')+'<span id=fbMsg class=faultmsg></span></div>';
+      '<span class=fbstat>since '+shortDate(d.startedAt)+'</span>'+
+      '<span class=fbstat title="Human overrides that the classifier will not touch.">'+d.locked+' locked</span>'+
+      '<span class=fbstat><span class=faultpill f-vendor_error>'+(codes.vendor_error||0)+'</span> <span class=faultpill f-client_change>'+(codes.client_change||0)+'</span> <span class=faultpill f-unclear>'+(codes.unclear||0)+'</span></span>'+
+      (d.pending?'<span class=fbstat>'+d.pending+' pending</span>':'')+
+      (d.pending?btn:'')+(d.keyPresent&&d.labelled?'<button class=faultghost onclick="reclassifyAll()" title="Re-run every unlocked edit through the current prompt. Locked rows untouched.">Re-classify</button>':'')+'<span id=fbMsg class=faultmsg></span></div>';
   }catch(e){el.innerHTML='';}
 }
 async function classifyBatch(){
@@ -2220,31 +2095,30 @@ async function classifyBatch(){
     else if(m){m.style.color='#dc2626';m.textContent=d.error||'Failed';}
   }catch(e){if(m){m.style.color='#dc2626';m.textContent='Failed';}}
 }
-// Fault adjudication. The three buttons write edit_fault (truth). "Suggest with AI"
-// writes only ai_fault -- Claude proposes, a human disposes. The agreement between the
-// two is the eval score for the prompt.
+async function reclassifyAll(){
+  if(!confirm('Re-run the classifier on all UNLOCKED edits with the current prompt? Rows you set by hand are untouched.'))return;
+  var m=document.getElementById('fbMsg');if(m){m.style.color='#64748b';m.textContent='Re-classifying\\u2026';}
+  try{
+    const r=await fetch('/vendor/api/admin/classify-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:50,mode:'reclassify'})});
+    const d=await r.json();
+    if(d.ok){if(m){m.style.color='#16a34a';m.textContent='Re-classified '+d.classified+(d.remaining?' \\u00b7 '+d.remaining+' left (click again)':'');}renderFaultBar();load();}
+    else if(m){m.style.color='#dc2626';m.textContent=d.error||'Failed';}
+  }catch(e){if(m){m.style.color='#dc2626';m.textContent='Failed';}}
+}
 function shortDate(iso){if(!iso)return '\\u2013';var d=new Date(iso);return isNaN(d)?'\\u2013':d.toLocaleDateString([],{month:'short',day:'numeric'});}
 function faultLabel(f){return f==='vendor_error'?'Our mistake':(f==='client_change'?'Client change':(f==='unclear'?'Unclear':''));}
 function faultBoxHtml(er){
   if(!er.id)return '';
   var cur=er.fault||'';
-  var human=er.faultSetBy&&er.faultSetBy.indexOf('claude:')!==0;
-  var who=cur?(human?'set by '+esc(er.faultSetBy):'auto-classified'):'awaiting classification';
+  var who=cur?(er.locked?'set by you':'auto-classified'):'awaiting classification';
   var chosen=cur?'<span class="faultpill f-'+cur+'">'+faultLabel(cur)+'</span><span class=faultby>'+who+'</span>'
                 :'<span class=faultby>'+who+'</span>';
-  var ai='';
-  if(er.aiFault){
-    var conf=(er.aiConfidence!=null&&er.aiConfidence!=='')?(' \\u00b7 '+Math.round(Number(er.aiConfidence)*100)+'% confident'):'';
-    var flag=(cur&&human&&cur!==er.aiFault)?' \\u2014 you overrode this':'';
-    ai='<div class=aisugg><b>Claude read it as:</b> '+faultLabel(er.aiFault)+esc(conf)+esc(flag)+
-      (er.aiRationale?'<div class=airat>'+esc(er.aiRationale)+'</div>':'')+'</div>';
-  }
   var btns=['vendor_error','client_change','unclear'].map(function(f){
     return '<button class="faultbtn'+(cur===f?' on':'')+'" onclick="setFault(\\''+er.id+'\\',\\''+f+'\\')">'+faultLabel(f)+'</button>';
   }).join('');
   return '<div class=faultbox><div class=tmpl-label>Fault</div>'+
-    '<div class=faultrow>'+chosen+'</div>'+ai+
-    '<div class=faultrow><span class=faultby>Override:</span>'+btns+(er.aiFault?'':'<button class=faultai onclick="suggestFault(\\''+er.id+'\\')">\\u2728 Classify now</button>')+'</div>'+
+    '<div class=faultrow>'+chosen+'</div>'+
+    '<div class=faultrow><span class=faultby>Override:</span>'+btns+'</div>'+
     '<div id=faultMsg class=faultmsg></div></div>';
 }
 async function setFault(editId,fault){
@@ -2252,19 +2126,11 @@ async function setFault(editId,fault){
   try{
     const r=await fetch('/vendor/api/admin/set-fault',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({editId:editId,fault:fault})});
     const d=await r.json();
-    if(d.ok){if(m){m.style.color='#16a34a';m.textContent='Saved.';}load();renderFaultBar();}
+    if(d.ok){if(m){m.style.color='#16a34a';m.textContent='Saved \\u0026 locked.';}load();renderFaultBar();}
     else if(m){m.style.color='#dc2626';m.textContent=d.error||'Could not save';}
   }catch(e){if(m){m.style.color='#dc2626';m.textContent='Could not save';}}
 }
-async function suggestFault(editId){
-  var m=document.getElementById('faultMsg');if(m){m.style.color='#64748b';m.textContent='Asking Claude\\u2026';}
-  try{
-    const r=await fetch('/vendor/api/admin/classify-edit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({editId:editId})});
-    const d=await r.json();
-    if(d.ok){if(m){m.style.color='#16a34a';m.textContent='Classified: '+faultLabel(d.adopted||d.fault);}load();renderFaultBar();}
-    else if(m){m.style.color='#dc2626';m.textContent=d.error||'Could not classify';}
-  }catch(e){if(m){m.style.color='#dc2626';m.textContent='Could not classify';}}
-}
+
 function vendList(arr){
   if(!arr.length)return '<div style=font-size:13px;color:#94a3b8>none</div>';
   return arr.map(function(v){return '<div class=specline>'+esc(v.contact||v.email)+' <span style=color:#94a3b8>('+v.load+(v.cap!=null?'/'+v.cap:'')+' load)</span></div>';}).join('');
