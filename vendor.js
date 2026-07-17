@@ -1044,7 +1044,7 @@ function mountVendorPortal(app, deps) {
       if (!id) return res.status(400).json({ ok: false, error: "Need order id" });
       const o = await getOrder(id);
       if (!o) return res.status(404).json({ ok: false, error: "Order not found" });
-      await patchOrder(id, { [F.claimState]: "completed", Pending: false, review_reasons: "", review_flagged_at: "" });
+      await patchOrder(id, { [F.claimState]: "completed", Pending: false, review_reasons: "", review_flagged_at: null });
       // First-completion stamp (write-once) now that it's truly complete.
       if (!firstCompletedOf(o)) { try { await patchOrder(id, { first_completed_at: Date.now() }); } catch (_) {} }
       if (String(o.message_sent || "").toLowerCase() !== "yes") {
@@ -1070,7 +1070,7 @@ function mountVendorPortal(app, deps) {
       // Back to the assigned vendor as claimed work, with the reviewer's notes attached.
       await patchOrder(id, {
         [F.claimState]: "claimed", Pending: true,
-        review_reasons: "", review_flagged_at: "",
+        review_reasons: "", review_flagged_at: null,
         review_rejected_notes: notes, review_rejected_at: Date.now(),
       });
       // Message the vendor the rejection so it surfaces in their thread.
