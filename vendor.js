@@ -317,6 +317,9 @@ function mountVendorPortal(app, deps) {
       rush: o.Rush || "no",
       multiEdit: o["Multiple Edit Alert"] === true,
       specialInstructions: o.Special_Instructions || "",
+      // Rejection from QA review: notes + when. Presence of notes = this order was returned.
+      rejectedNotes: o.review_rejected_notes || "",
+      rejectedAt: o.review_rejected_at || null,
       thumb,
       files: fileLinks(o),
       details: {
@@ -952,6 +955,8 @@ function mountVendorPortal(app, deps) {
         Pending: false, Edit_Requested: false,
         [F.claimState]: goToReview ? "needs_review" : "completed",
         artist_reported_count: Number(logos),
+        // A re-upload answers any prior rejection: clear the alarm so it stops screaming.
+        review_rejected_notes: "", review_rejected_at: null,
       };
       if (goToReview) {
         // Store why it failed + the preview so the admin review slide-over can show it.
@@ -2346,6 +2351,21 @@ main{max-width:880px;margin:18px auto;padding:0 16px}
 @keyframes procspin{to{transform:rotate(360deg)}}
 .procmsg{font-size:16px;font-weight:700;color:#0f172a}
 .procsub{font-size:13px;color:#64748b;margin-top:6px;line-height:1.4}
+.mini.m-returned{background:#dc2626;color:#fff;font-weight:800;letter-spacing:.02em;animation:retpulse 1.4s ease-in-out infinite}
+@keyframes retpulse{0%,100%{opacity:1}50%{opacity:.55}}
+.rejmodal{position:fixed;inset:0;background:rgba(30,0,0,.6);display:none;align-items:center;justify-content:center;z-index:10000}
+.rejmodal.on{display:flex}
+.rejbox{background:#fff;border-radius:14px;max-width:460px;width:90%;padding:0;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.4);border:3px solid #dc2626}
+.rejhead{background:#dc2626;color:#fff;font-size:17px;font-weight:800;padding:16px 20px;text-align:center;letter-spacing:.02em}
+.rejorder{font-size:15px;font-weight:700;color:#0f172a;padding:16px 20px 4px}
+.rejlabel{font-size:12px;font-weight:700;color:#b91c1c;text-transform:uppercase;letter-spacing:.05em;padding:8px 20px 0}
+.rejnotes{font-size:15px;color:#1f2937;padding:6px 20px 16px;line-height:1.5;white-space:pre-wrap}
+.rejack{display:block;width:calc(100% - 40px);margin:0 20px 20px;background:#dc2626;color:#fff;border:0;border-radius:9px;padding:13px;font-size:15px;font-weight:700;cursor:pointer}
+.rejack:hover{background:#b91c1c}
+.rejbanner{background:#fef2f2;border:2px solid #dc2626;border-radius:10px;padding:14px 16px;margin-bottom:14px}
+.rejbannerhead{color:#b91c1c;font-size:14px;font-weight:800;letter-spacing:.02em}
+.rejbannerbody{color:#1f2937;font-size:15px;margin-top:8px;line-height:1.5;white-space:pre-wrap;font-weight:600}
+.rejbannersub{color:#7f1d1d;font-size:12.5px;margin-top:8px}
 .mailmsg{font-size:12.5px;font-weight:600}
 .uploadwrap{margin-top:16px;border-top:1px solid #eef2f6;padding-top:14px}
 .uploadwrap .tag{font-size:12px;color:#64748b;display:block;margin-top:10px;margin-bottom:3px}
@@ -2383,6 +2403,36 @@ async function load(){
   if(data.actingAs){banner.style.display='block';banner.innerHTML='Viewing as '+esc(data.actingAs)+' \\u2014 <a href="#" onclick="stopRunAs();return false">exit</a>';}
   renderChips();renderList();
   if(panelOpenId&&byId[panelOpenId])fillPanel(byId[panelOpenId]);
+  checkRejections();
+}
+// Loud, blocking acknowledgement for any order returned by QA review. The vendor must
+// dismiss it, so a rejection can't be missed the way a buried message can. Uses a
+// per-order+timestamp key so it only nags once per rejection (not every refresh).
+var _ackedRejections={};
+function checkRejections(){
+  var rejected=(data.claimed||[]).filter(function(o){return o.rejectedNotes;});
+  if(!rejected.length)return;
+  // Show the most recent unacknowledged one.
+  var pending=rejected.filter(function(o){return _ackedRejections[o.id+':'+o.rejectedAt]!==true;});
+  if(!pending.length)return;
+  var o=pending[0];
+  showRejectModal(o);
+}
+function showRejectModal(o){
+  var m=document.getElementById('rejectModal');
+  if(!m){
+    m=document.createElement('div');m.id='rejectModal';m.className='rejmodal';
+    m.innerHTML='<div class=rejbox><div class=rejhead>\\u26A0 ORDER RETURNED \\u2014 FIXES NEEDED</div><div id=rejOrder class=rejorder></div><div class=rejlabel>What needs to be fixed:</div><div id=rejNotes class=rejnotes></div><button id=rejAck class=rejack>I understand \\u2014 open this order</button></div>';
+    document.body.appendChild(m);
+  }
+  document.getElementById('rejOrder').textContent='Order '+(o.orderNo||o.id);
+  document.getElementById('rejNotes').textContent=o.rejectedNotes||'';
+  document.getElementById('rejAck').onclick=function(){
+    _ackedRejections[o.id+':'+o.rejectedAt]=true;
+    m.classList.remove('on');
+    var k=o._key||o.id;if(byId[k])openDetail(k);
+  };
+  m.classList.add('on');
 }
 function renderChips(){
   var av=(data.claimable||[]).filter(function(o){return !o.locked;}).length,ed=(data.edits||[]).length;
@@ -2457,6 +2507,7 @@ function rowHtml(o,state){
   var cls='row'+(state==='edit'?' ed':'');
   var thumb=o.thumb?'<img class=rthumb src="'+o.thumb+'" onerror="this.outerHTML=phThumb()">':phThumb();
   var marks='';
+  if(o.rejectedNotes)marks+='<span class="mini m-returned">\\u26A0 RETURNED \\u2014 FIXES NEEDED</span>';
   if(o.unread)marks+='<span class="mini msgnew">\\uD83D\\uDCAC New</span>';
   if(o.separations==='yes')marks+='<span class="mini m-sep">Sep</span>';
   if(o.multiEdit)marks+='<span class="mini m-multi">\\u26A0 Multi-edit</span>';
@@ -2530,12 +2581,14 @@ function fillPanel(o){
     (o.rush==='yes'?'<span class="badge b-rush">RUSH</span>':'')+
     (o.separations==='yes'?'<span class="badge b-sep">SEPARATIONS</span>':'');
   var multi=o.multiEdit?'<div class=multibanner>\\u26A0 This order has had multiple edits</div>':'';
+  // Rejection banner sits at the very top of the panel body, above everything.
+  var reject=o.rejectedNotes?'<div class=rejbanner><div class=rejbannerhead>\\u26A0 THIS ORDER WAS RETURNED \\u2014 FIXES NEEDED</div><div class=rejbannerbody>'+esc(o.rejectedNotes)+'</div><div class=rejbannersub>Fix the issue(s) above, then re-upload your files below.</div></div>':'';
   var thumb=o.thumb?'<img class=pthumb src="'+o.thumb+'" onclick="window.open(\\''+o.thumb+'\\',\\'_blank\\')" onerror="this.style.display=\\'none\\'">':'';
   var notes=o.specialInstructions?'<div class=notes><b>Special instructions:</b> '+esc(o.specialInstructions)+'</div>':'';
   var action=(state==='available')?'<div class=paction><button class=upload style=background:#16a34a onclick="claim(\\''+o.id+'\\')">Claim this order</button></div>':uploadFormHtml(o,state==='edit');
   var mailMe=(state==='available')?'':'<div class=mailme><button id=mailBtn class=mailbtn onclick="emailInstructions(\\''+o.id+'\\')">\\u2709 Email me these instructions</button><span id=mailMsg class=mailmsg></span></div>';
   panel.innerHTML='<div class=phead><div><div class=ptitle>Order '+esc(o.orderNo||'')+'</div><div class=peyebrow>'+esc(o.type||'')+'</div></div><div style=display:flex;gap:8px;align-items:center>'+pill+'<button class=pclose onclick="closeDetail()">\\u2715</button></div></div>'+
-    '<div class=pbody>'+multi+'<div>'+badges+'</div>'+thumb+(state==='edit'?editBlockHtml(o):'')+notes+specBlockHtml(o)+tmplBlockHtml(o)+filesBlockHtml(o,state)+mailMe+action+(state!=='available'?msgBlockHtml(o):'')+'</div>';
+    '<div class=pbody>'+reject+multi+'<div>'+badges+'</div>'+thumb+(state==='edit'?editBlockHtml(o):'')+notes+specBlockHtml(o)+tmplBlockHtml(o)+filesBlockHtml(o,state)+mailMe+action+(state!=='available'?msgBlockHtml(o):'')+'</div>';
 }
 async function emailInstructions(id){
   var b=document.getElementById('mailBtn'),m=document.getElementById('mailMsg');
