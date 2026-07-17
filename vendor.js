@@ -99,6 +99,9 @@ const { FAULT_MODEL, FAULT_CONFIDENCE_FLOOR, FAULT_CODES, FAULT_PROMPT } = requi
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || "";
 const AUTO_CLASSIFY_MIN = Number(process.env.FAULT_AUTO_CLASSIFY_MIN || 30);
 const SWEEP_BATCH = Math.min(Math.max(Number(process.env.FAULT_SWEEP_BATCH || 25), 1), 100);
+// Global fallback idle threshold (hours). Must match app.js IDLE_DEFAULT_HOURS -- app.js
+// uses it for the reassign sweep; here it's only for the admin display default.
+const IDLE_DEFAULT_HOURS = Number(process.env.IDLE_DEFAULT_HOURS || 5);
 const FAULT_START_ISO = (() => {
   const raw = process.env.FAULT_START_DATE;
   if (raw) { const d = new Date(raw); if (!isNaN(d)) return d.toISOString();
@@ -841,17 +844,21 @@ function mountVendorPortal(app, deps) {
 
       const spec = [];
       const addSpec = (k, v) => { if (v !== undefined && v !== null && String(v).trim() !== "") spec.push(`  ${k}: ${v}`); };
-      addSpec("Height", o.Height); addSpec("Width", o.Width);
-      addSpec("Units", o["cm/in"]); addSpec("Stitch count", o.Stitch_Count);
-      addSpec("Number of logos", o.Unit);
-      addSpec("Art size", o.ArtDims_Seps); addSpec("Film size", o.FilmSizeSeps);
-      addSpec("Art placement", o.ArtPlacement_Seps);
+      // Lead with the digitizing essentials (same order the vendor sees on screen), then
+      // the separations/common fields. `extra` is the New_Order record for digitizing.
       if (extra) {
         if (extra.dimension && extra.proportionalTo) addSpec("Requested size", `${extra.dimension}" ${String(extra.proportionalTo).toLowerCase()}`);
         const pl = String(extra.placement || "").toLowerCase();
         const kind = (pl.includes("round") || pl.includes("hat") || pl.includes("cap")) ? "Cap / Round (bottom-up, center-out)" : ((pl.includes("flat") || pl.includes("left to right")) ? "Flat (left-to-right)" : "");
         if (kind) addSpec("Type", kind);
         if (extra.specialInstructions) addSpec("Special instructions", extra.specialInstructions);
+      }
+      addSpec("Height", o.Height); addSpec("Width", o.Width);
+      addSpec("Units", o["cm/in"]); addSpec("Stitch count", o.Stitch_Count);
+      addSpec("Number of logos", o.Unit);
+      addSpec("Art size", o.ArtDims_Seps); addSpec("Film size", o.FilmSizeSeps);
+      addSpec("Art placement", o.ArtPlacement_Seps);
+      if (extra) {
         addSpec("Placement", extra.placement); addSpec("3D puff", extra.puff); addSpec("Fabric", extra.fabric);
       }
       if (spec.length) { L.push("SPECS"); L.push(...spec); L.push(""); }
@@ -1600,7 +1607,14 @@ function mountVendorPortal(app, deps) {
       const id = String(req.query.id || "");
       // No id -> list a few rows so we can discover the real field keys.
       if (!id) {
-        const rows = await bubble("GET", `/${type}?limit=3`).then(r => r.response.results || []);
+        // Optional field filter so you can find specific records, e.g.
+        //   raw?type=New_Order&find=Order%23&is=DIG201F22AQ
+        const constraints = [];
+        if (req.query.find && req.query.is)
+          constraints.push({ key: String(req.query.find), constraint_type: "equals", value: String(req.query.is) });
+        const lim = Math.min(Math.max(Number(req.query.limit) || 5, 1), 20);
+        const q = `constraints=${encodeURIComponent(JSON.stringify(constraints))}&limit=${lim}`;
+        const rows = await bubble("GET", `/${type}?${q}`).then(r => r.response.results || []);
         return res.type("json").send(JSON.stringify({ type, count: rows.length, sample: rows }, null, 2));
       }
       const rec = await bubble("GET", `/${type}/${id}`).then(r => r.response);
@@ -2461,7 +2475,7 @@ function specBlockHtml(o){
     // Plain cap/flat label parsed from the Placement string.
     var pl=String(no.placement||'').toLowerCase();
     var kind=(pl.indexOf('round')>=0||pl.indexOf('hat')>=0||pl.indexOf('cap')>=0)?'Cap / Round (sew bottom-up, center-out)':((pl.indexOf('flat')>=0||pl.indexOf('left to right')>=0)?'Flat (sew left-to-right)':'');
-    var db=rowS('Requested size',reqSize)+rowS('Type',kind)+rowS('Special instructions',no.specialInstructions)+rowS('Height',d.Height)+rowS('Width',d.Width)+rowS('Unit',unit)+rowS('3D Puff',no.puff)+rowS('Fabric content',no.fabric)+rowS('Placement',no.placement);
+    var db=rowS('Requested size',reqSize)+rowS('Type',kind)+rowS('Special instructions',no.specialInstructions)+rowS('Height',d.Height)+rowS('Width',d.Width)+rowS('Number of logos',unit)+rowS('3D Puff',no.puff)+rowS('Fabric content',no.fabric)+rowS('Placement',no.placement);
     if(db)out+='<div class=spec><div class=spec-label>Digitizing spec</div>'+db+'</div>';
   }
   return out;
