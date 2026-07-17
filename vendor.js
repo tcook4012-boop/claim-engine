@@ -344,6 +344,7 @@ function mountVendorPortal(app, deps) {
         placement: pick("Placement", "placement"),
         proportionalTo: pick("Proportional_to", "proportional_to", "Proportional_To"),
         dimension: pick("Dimension", "dimension"),
+        specialInstructions: pick("Special_Instructions", "special_instructions"),
       };
     } catch (e) { console.warn("[orders] New_Order lookup failed for " + orderNo + ":", e.message); return null; }
   }
@@ -845,7 +846,14 @@ function mountVendorPortal(app, deps) {
       addSpec("Number of logos", o.Unit);
       addSpec("Art size", o.ArtDims_Seps); addSpec("Film size", o.FilmSizeSeps);
       addSpec("Art placement", o.ArtPlacement_Seps);
-      if (extra) { addSpec("Placement", extra.placement); addSpec("3D puff", extra.puff); addSpec("Fabric", extra.fabric); }
+      if (extra) {
+        if (extra.dimension && extra.proportionalTo) addSpec("Requested size", `${extra.dimension}" ${String(extra.proportionalTo).toLowerCase()}`);
+        const pl = String(extra.placement || "").toLowerCase();
+        const kind = (pl.includes("round") || pl.includes("hat") || pl.includes("cap")) ? "Cap / Round (bottom-up, center-out)" : ((pl.includes("flat") || pl.includes("left to right")) ? "Flat (left-to-right)" : "");
+        if (kind) addSpec("Type", kind);
+        if (extra.specialInstructions) addSpec("Special instructions", extra.specialInstructions);
+        addSpec("Placement", extra.placement); addSpec("3D puff", extra.puff); addSpec("Fabric", extra.fabric);
+      }
       if (spec.length) { L.push("SPECS"); L.push(...spec); L.push(""); }
 
       if (o.Special_Instructions) { L.push("SPECIAL INSTRUCTIONS"); L.push(`  ${o.Special_Instructions}`); L.push(""); }
@@ -2442,7 +2450,20 @@ function specBlockHtml(o){
   var d=o.details||{};var unit=d['cm/in']||d.Unit||'';var out='';
   function rowS(label,val){return (val===''||val==null)?'':'<div class=specline><b>'+label+':</b> '+esc(String(val))+'</div>';}
   if(o.separations==='yes'){var sb=rowS('Film Size',d.FilmSizeSeps)+rowS('Art Size',d.ArtDims_Seps)+rowS('Art Placement',d.ArtPlacement_Seps)+rowS('Unit',unit);if(sb)out+='<div class=spec><div class=spec-label>Separations spec</div>'+sb+'</div>';}
-  if((o.type||'').toLowerCase()==='digitizing'){var no=d.newOrder||{};var db=rowS('Height',d.Height)+rowS('Width',d.Width)+rowS('Unit',unit)+rowS('3D Puff',no.puff)+rowS('Fabric content',no.fabric)+rowS('Placement',no.placement);if(db)out+='<div class=spec><div class=spec-label>Digitizing spec</div>'+db+'</div>';}
+  if((o.type||'').toLowerCase()==='digitizing'){
+    var no=d.newOrder||{};
+    // Requested size (the value the QA check measures against): Dimension + Proportional_to.
+    var reqSize='';
+    if(no.dimension&&no.proportionalTo){
+      var axis=String(no.proportionalTo).toLowerCase()==='tall'?'tall':(String(no.proportionalTo).toLowerCase()==='wide'?'wide':String(no.proportionalTo));
+      reqSize=no.dimension+'\\u2033 '+axis;
+    }
+    // Plain cap/flat label parsed from the Placement string.
+    var pl=String(no.placement||'').toLowerCase();
+    var kind=(pl.indexOf('round')>=0||pl.indexOf('hat')>=0||pl.indexOf('cap')>=0)?'Cap / Round (sew bottom-up, center-out)':((pl.indexOf('flat')>=0||pl.indexOf('left to right')>=0)?'Flat (sew left-to-right)':'');
+    var db=rowS('Requested size',reqSize)+rowS('Type',kind)+rowS('Special instructions',no.specialInstructions)+rowS('Height',d.Height)+rowS('Width',d.Width)+rowS('Unit',unit)+rowS('3D Puff',no.puff)+rowS('Fabric content',no.fabric)+rowS('Placement',no.placement);
+    if(db)out+='<div class=spec><div class=spec-label>Digitizing spec</div>'+db+'</div>';
+  }
   return out;
 }
 function tmplBlockHtml(o){
