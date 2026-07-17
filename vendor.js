@@ -2339,6 +2339,13 @@ main{max-width:880px;margin:18px auto;padding:0 16px}
 .mailbtn{background:#f1f5f9;color:#334155;border:1px solid #dbe3ea;border-radius:8px;padding:8px 13px;font-size:13px;font-weight:600;cursor:pointer}
 .mailbtn:hover{background:#e9eef4}
 .mailbtn:disabled{opacity:.6;cursor:default}
+.procoverlay{position:fixed;inset:0;background:rgba(15,23,42,.55);display:none;align-items:center;justify-content:center;z-index:9999}
+.procoverlay.on{display:flex}
+.procbox{background:#fff;border-radius:14px;padding:28px 34px;max-width:340px;text-align:center;box-shadow:0 12px 40px rgba(0,0,0,.25)}
+.procspin{width:38px;height:38px;margin:0 auto 14px;border:4px solid #e2e8f0;border-top-color:#2563eb;border-radius:50%;animation:procspin 0.8s linear infinite}
+@keyframes procspin{to{transform:rotate(360deg)}}
+.procmsg{font-size:16px;font-weight:700;color:#0f172a}
+.procsub{font-size:13px;color:#64748b;margin-top:6px;line-height:1.4}
 .mailmsg{font-size:12.5px;font-weight:600}
 .uploadwrap{margin-top:16px;border-top:1px solid #eef2f6;padding-top:14px}
 .uploadwrap .tag{font-size:12px;color:#64748b;display:block;margin-top:10px;margin-bottom:3px}
@@ -2579,11 +2586,31 @@ function timerClass(since){
   if(isNaN(h))return 't-green';
   if(h>14)return 't-red';if(h>=6)return 't-orange';return 't-green';
 }
+// Full-screen processing overlay so the vendor gets feedback during the wait. Upload runs
+// the DST checks (Python decode + preview render) which can take several seconds; without
+// this the button looks dead and people click twice.
+function showProcessing(msg,sub){
+  var o=document.getElementById('procOverlay');
+  if(!o){
+    o=document.createElement('div');o.id='procOverlay';o.className='procoverlay';
+    o.innerHTML='<div class=procbox><div class=procspin></div><div id=procMsg class=procmsg></div><div id=procSub class=procsub></div></div>';
+    document.body.appendChild(o);
+  }
+  document.getElementById('procMsg').textContent=msg||'Processing\\u2026';
+  document.getElementById('procSub').textContent=sub||'';
+  o.classList.add('on');
+}
+function hideProcessing(){var o=document.getElementById('procOverlay');if(o)o.classList.remove('on');}
+
 async function claim(id){
-  const r=await fetch('/vendor/api/claim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({orderId:id})});
-  const d=await r.json();
-  if(!d.ok){var m=d.reason==='claim_oldest_first'?'Please claim the oldest order in line first.':(d.reason==='at_digitizing_limit'?'You\\'re at your digitizing limit \\u2014 finish a digitizing job first.':(d.reason==='at_other_limit'?'You\\'re at your vector/digital limit \\u2014 finish one first.':(d.reason||d.error||'Could not claim')));alert(m);}
-  panelOpenId=null;panel.classList.remove('open');backdrop.classList.remove('open');load();
+  showProcessing('Claiming order\\u2026','Adding it to your queue');
+  try{
+    const r=await fetch('/vendor/api/claim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({orderId:id})});
+    const d=await r.json();
+    hideProcessing();
+    if(!d.ok){var m=d.reason==='claim_oldest_first'?'Please claim the oldest order in line first.':(d.reason==='at_digitizing_limit'?'You\\'re at your digitizing limit \\u2014 finish a digitizing job first.':(d.reason==='at_other_limit'?'You\\'re at your vector/digital limit \\u2014 finish one first.':(d.reason||d.error||'Could not claim')));alert(m);return;}
+    panelOpenId=null;panel.classList.remove('open');backdrop.classList.remove('open');load();
+  }catch(e){hideProcessing();alert('Could not claim \\u2014 please try again.');}
 }
 async function submitPanel(id,emb){
   var prev=document.getElementById('pPrev').files[0];
@@ -2597,10 +2624,20 @@ async function submitPanel(id,emb){
   if(emb){var w=document.getElementById('pW').value,h=document.getElementById('pH').value,sc=document.getElementById('pSc').value;
     if(!w||!h||!sc){alert('Digitizing orders require Width, Height, and Stitch Count');return;}
     fd.append('width',w);fd.append('height',h);fd.append('stitchCount',sc);}
-  var r=await fetch('/vendor/api/upload',{method:'POST',body:fd});
-  var d=await r.json();
-  if(!d.ok){alert(d.error||'Upload failed');return;}
-  panelOpenId=null;panel.classList.remove('open');backdrop.classList.remove('open');load();
+  // Digitizing runs the automated QA check (size + sew direction + preview), which takes a
+  // few seconds; other types just upload. Message accordingly.
+  showProcessing(emb?'Checking your file\\u2026':'Submitting\\u2026', emb?'Running automated quality checks. This can take a few seconds.':'Uploading your files');
+  try{
+    var r=await fetch('/vendor/api/upload',{method:'POST',body:fd});
+    var d=await r.json();
+    hideProcessing();
+    if(!d.ok){alert(d.error||'Upload failed');return;}
+    if(d.review){
+      var reasons=(d.failures&&d.failures.length)?('\\n\\n\\u2022 '+d.failures.join('\\n\\u2022 ')):'';
+      alert('Submitted \\u2014 but our automated check flagged this for review before it goes to the client:'+reasons+'\\n\\nOur team will review it shortly. No action needed from you right now.');
+    }
+    panelOpenId=null;panel.classList.remove('open');backdrop.classList.remove('open');load();
+  }catch(e){hideProcessing();alert('Upload failed \\u2014 please try again.');}
 }
 async function logout(){await fetch('/vendor/api/logout',{method:'POST'});location.href='/vendor/login';}
 async function stopRunAs(){await fetch('/vendor/api/admin/stop-run-as',{method:'POST'});location.href='/vendor/admin';}
