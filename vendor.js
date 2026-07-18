@@ -757,6 +757,7 @@ function mountVendorPortal(app, deps) {
       result.ran = true;
       if (!r || r.ok === false) { result.pass = false; result.failures.push("Could not analyze the DST file" + (r && r.error ? ` (${r.error})` : "")); return result; }
       result.size = r.sizeInches || null;
+      result.stitchCount = (r.stitchCount != null) ? r.stitchCount : null;
       result.direction = r.direction || null;
       result.preview = r.preview || null;
       if (Array.isArray(r.notes)) result.notes.push(...r.notes);
@@ -921,13 +922,14 @@ function mountVendorPortal(app, deps) {
       if (!previewFile && supportFiles.length === 0)
         return res.status(400).json({ ok: false, error: "Attach at least a preview or a file" });
 
-      // Embroidery = "Digitizing" order type: REQUIRES height, width, stitch count.
+      // Embroidery = "Digitizing" order type. Height/Width/Stitch count are NO LONGER
+      // typed by the vendor -- they are pulled from the DST file below (the file is the
+      // source of truth; vendors skipped or fudged these anyway). Kept as optional
+      // fallbacks only if present.
       const isEmbroidery = (o.Order_Type || "").toLowerCase() === "digitizing";
       const height = String(req.body.height || "").trim();
       const width  = String(req.body.width  || "").trim();
       const stitch = String(req.body.stitchCount || "").trim();
-      if (isEmbroidery && (!height || !width || !stitch))
-        return res.status(400).json({ ok: false, error: "Digitizing orders require Height, Width, and Stitch Count" });
 
       // Number of logos -> Artist_reported_count, required on ALL order types.
       const logos = String(req.body.logos || "").trim();
@@ -944,9 +946,12 @@ function mountVendorPortal(app, deps) {
         if (dstFile) {
           const no = await newOrdersDetail(o["Order#"]);
           qa = await runDstChecks(dstFile, no);
-          console.log(`[qa] order ${o["Order#"]}: ran=${qa.ran} pass=${qa.pass} failures=${qa.failures.length}`);
+          console.log(`[qa] order ${o["Order#"]}: ran=${qa.ran} pass=${qa.pass} failures=${qa.failures.length} size=${JSON.stringify(qa.size)} stitches=${qa.stitchCount}`);
         } else {
-          console.log(`[qa] order ${o["Order#"]}: no .dst among uploads -- skipped`);
+          // Every digitizing order is supposed to have a DST. If it's missing we can't pull
+          // the client-facing dimensions, so route to review rather than complete blind.
+          qa = { ran: true, pass: false, failures: ["No .dst file found in the upload. Digitizing orders must include the .dst so we can verify size and stitch count."], preview: null };
+          console.log(`[qa] order ${o["Order#"]}: no .dst among uploads -- routed to review`);
         }
       }
       const goToReview = qa.ran && !qa.pass;
@@ -966,11 +971,16 @@ function mountVendorPortal(app, deps) {
       }
 
       if (isEmbroidery) {
-        // Bubble's Height/Width/Stitch_Count are TEXT fields (the read side falls back to
-        // ""), so send the trimmed strings as-is rather than coercing to Number.
-        patch.Height = height;
-        patch.Width = width;
-        patch.Stitch_Count = stitch;
+        // Height/Width/Stitch_Count come FROM THE DST FILE (qa.size / qa.stitchCount), not
+        // from the vendor. The file is the source of truth for what the client sees. Bubble's
+        // fields are TEXT, so write strings. Fall back to any typed value only if the file
+        // didn't yield one (shouldn't happen -- every digitizing order has a DST).
+        if (qa.size && qa.size.w != null) patch.Width = String(qa.size.w);
+        else if (width) patch.Width = width;
+        if (qa.size && qa.size.h != null) patch.Height = String(qa.size.h);
+        else if (height) patch.Height = height;
+        if (qa.stitchCount != null) patch.Stitch_Count = String(qa.stitchCount);
+        else if (stitch) patch.Stitch_Count = stitch;
       }
 
       // Preview -> single `image` field (base64 object on a single field works).
@@ -2351,6 +2361,7 @@ main{max-width:880px;margin:18px auto;padding:0 16px}
 @keyframes procspin{to{transform:rotate(360deg)}}
 .procmsg{font-size:16px;font-weight:700;color:#0f172a}
 .procsub{font-size:13px;color:#64748b;margin-top:6px;line-height:1.4}
+.embnote{background:#eff6ff;border:1px solid #bfdbfe;color:#1e40af;border-radius:8px;padding:9px 12px;font-size:12.5px;margin:8px 0}
 .mini.m-returned{background:#dc2626;color:#fff;font-weight:800;letter-spacing:.02em;animation:retpulse 1.4s ease-in-out infinite}
 @keyframes retpulse{0%,100%{opacity:1}50%{opacity:.55}}
 .rejmodal{position:fixed;inset:0;background:rgba(30,0,0,.6);display:none;align-items:center;justify-content:center;z-index:10000}
@@ -2563,7 +2574,7 @@ function filesBlockHtml(o,state){
 function uploadFormHtml(o,isEdit){
   if(!o.id)return '<div class=uploadwrap><div style=font-size:13px;color:#b91c1c>Original order not found \\u2014 cannot upload a revision.</div></div>';
   var emb=(o.type||'').toLowerCase()==='digitizing';
-  var embFields=emb?('<span class=tag style=color:#b45309;font-weight:600>Digitizing \\u2014 required:</span><div style=display:flex;gap:8px;flex-wrap:wrap><input id=pW type=number placeholder="Width" style=width:90px><input id=pH type=number placeholder="Height" style=width:90px><input id=pSc type=number placeholder="Stitch count" style=width:120px></div>'):'';
+  var embFields=emb?('<div class=embnote>\\u2139 Width, height, and stitch count are read automatically from your .dst file \\u2014 no need to enter them.</div>'):'';
   return '<div class=uploadwrap>'+
     '<span class=tag>Preview JPEG (before/after):</span><input id=pPrev type=file accept="image/*">'+
     '<span class=tag>Supporting files (replaces existing):</span><input id=pSup type=file multiple>'+
@@ -2674,9 +2685,7 @@ async function submitPanel(id,emb){
   var fd=new FormData();fd.append('orderId',id);fd.append('logos',logos);
   if(prev)fd.append('preview',prev);
   for(var i=0;i<sup.length;i++)fd.append('supporting',sup[i]);
-  if(emb){var w=document.getElementById('pW').value,h=document.getElementById('pH').value,sc=document.getElementById('pSc').value;
-    if(!w||!h||!sc){alert('Digitizing orders require Width, Height, and Stitch Count');return;}
-    fd.append('width',w);fd.append('height',h);fd.append('stitchCount',sc);}
+  // Digitizing: width/height/stitch are pulled from the .dst on the server, not typed.
   // Digitizing runs the automated QA check (size + sew direction + preview), which takes a
   // few seconds; other types just upload. Message accordingly.
   showProcessing(emb?'Checking your file\\u2026':'Submitting\\u2026', emb?'Running automated quality checks. This can take a few seconds.':'Uploading your files');
