@@ -55,6 +55,12 @@ def analyze(path):
     else:
         out["ok"] = False
         out["notes"].append("Could not read size from DST header.")
+    # Exact stitch count from the header ST field (authoritative, no decode needed).
+    try:
+        st = hdr.get("ST", "").strip()
+        out["stitchCount"] = int(st) if st else None
+    except (ValueError, AttributeError):
+        out["stitchCount"] = None
 
     # ---- Stitch decode (direction + preview) via pyembroidery ----
     try:
