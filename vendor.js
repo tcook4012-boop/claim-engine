@@ -96,6 +96,8 @@ const completedAtMs = (o) => { const fc = firstCompletedOf(o); return fc ? new D
      edit_fault    (text)   vendor_error | client_change | unclear
      fault_locked  (yes/no) a human set it; the classifier must not overwrite. */
 const { FAULT_MODEL, FAULT_CONFIDENCE_FLOOR, FAULT_CODES, FAULT_PROMPT } = require("./fault-prompt");
+const VISION = require("./vision-checks");
+const CLOUDCONVERT_KEY = process.env.CLOUDCONVERT_API_KEY || "";
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || "";
 const AUTO_CLASSIFY_MIN = Number(process.env.FAULT_AUTO_CLASSIFY_MIN || 30);
 const SWEEP_BATCH = Math.min(Math.max(Number(process.env.FAULT_SWEEP_BATCH || 25), 1), 100);
@@ -351,6 +353,7 @@ function mountVendorPortal(app, deps) {
         proportionalTo: pick("Proportional_to", "proportional_to", "Proportional_To"),
         dimension: pick("Dimension", "dimension"),
         specialInstructions: pick("Special_Instructions", "special_instructions"),
+        uploadedFiles: (Array.isArray(n.Uploaded_files) ? n.Uploaded_files : []).filter(Boolean),
       };
     } catch (e) { console.warn("[orders] New_Order lookup failed for " + orderNo + ":", e.message); return null; }
   }
@@ -793,6 +796,129 @@ function mountVendorPortal(app, deps) {
     } finally { if (tmp) { try { fs.unlinkSync(tmp); } catch (_) {} } }
   }
 
+  /* ---- Vector visual QA (CloudConvert + Claude vision) -----------------------
+     On a completed VECTOR order, compares the vendor's finished PNG against the client's
+     original art (converting non-PNG originals via CloudConvert first), and checks any
+     written instructions. Flags clear problems to the same review bucket as DST.
+
+     Fail-safe throughout: any failure (no key, conversion error, vision error) returns a
+     result that routes the order to review — never silently passes. */
+
+  const extOf = (name) => String(name || "").toLowerCase().split(".").pop() || "";
+  const asHttps = (u) => { u = String(u || ""); return u.startsWith("//") ? "https:" + u : u; };
+
+  // --- CloudConvert: convert one remote file URL to PNG, return its download URL. ---
+  // Uses a single job with import-url -> convert -> export-url tasks, then polls the job.
+  async function cloudConvertToPng(fileUrl) {
+    if (!CLOUDCONVERT_KEY) throw new Error("CLOUDCONVERT_API_KEY not set");
+    const base = "https://api.cloudconvert.com/v2";
+    const headers = { "Authorization": "Bearer " + CLOUDCONVERT_KEY, "Content-Type": "application/json" };
+    const inFmt = extOf(fileUrl);
+    const job = await fetch(base + "/jobs", {
+      method: "POST", headers,
+      body: JSON.stringify({
+        tasks: {
+          "imp": { operation: "import/url", url: asHttps(fileUrl) },
+          "conv": { operation: "convert", input: "imp", output_format: "png", input_format: inFmt || undefined,
+                    // For multi-page/vector sources, take the first page and a sane pixel width.
+                    engine_version: undefined, pixel_density: 96, width: 1200 },
+          "exp": { operation: "export/url", input: "conv" },
+        },
+      }),
+    });
+    if (!job.ok) throw new Error("CloudConvert job create " + job.status + ": " + (await job.text()).slice(0, 160));
+    const jobId = (await job.json()).data.id;
+
+    // Poll the job until finished/error (cap ~40s).
+    const started = Date.now();
+    while (Date.now() - started < 40000) {
+      await new Promise((r) => setTimeout(r, 2500));
+      const st = await fetch(base + "/jobs/" + jobId, { headers });
+      if (!st.ok) continue;
+      const data = (await st.json()).data;
+      if (data.status === "finished") {
+        const exp = (data.tasks || []).find((t) => t.operation === "export/url" && t.status === "finished");
+        const f = exp && exp.result && exp.result.files && exp.result.files[0];
+        if (f && f.url) return f.url;
+        throw new Error("CloudConvert finished but no export URL");
+      }
+      if (data.status === "error") {
+        const bad = (data.tasks || []).find((t) => t.status === "error");
+        throw new Error("CloudConvert task error: " + (bad ? (bad.code || bad.message) : "unknown"));
+      }
+    }
+    throw new Error("CloudConvert timed out");
+  }
+
+  // Fetch a URL and return { b64, media } for a Claude image block. Converts if needed.
+  async function toVisionImage(fileUrl) {
+    const ext = extOf(fileUrl);
+    let url = asHttps(fileUrl), media = "image/png";
+    if (VISION.NATIVE_IMAGE_EXT.includes(ext)) {
+      media = ext === "jpg" ? "image/jpeg" : ("image/" + (ext === "jpeg" ? "jpeg" : ext));
+    } else if (VISION.CONVERTIBLE_EXT.includes(ext)) {
+      url = await cloudConvertToPng(fileUrl); media = "image/png";
+    } else {
+      // Unknown type: try converting; if it fails, the caller routes to review.
+      url = await cloudConvertToPng(fileUrl); media = "image/png";
+    }
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error("download failed " + resp.status);
+    const buf = Buffer.from(await resp.arrayBuffer());
+    return { b64: buf.toString("base64"), media };
+  }
+
+  // Run the vector visual check. vendorPng = { buffer, media } from the upload (in memory);
+  // clientFileUrls = the client's original art URLs. Returns { ran, pass, failures[] }.
+  async function runVectorVisualCheck(vendorPng, clientFileUrls, instructions) {
+    const result = { ran: false, pass: true, failures: [] };
+    const ANTHROPIC = process.env.ANTHROPIC_API_KEY || "";
+    if (!ANTHROPIC) { result.ran = true; result.pass = false; result.failures.push("Visual check unavailable (ANTHROPIC_API_KEY not set) — routed to review."); return result; }
+    if (!CLOUDCONVERT_KEY) { result.ran = true; result.pass = false; result.failures.push("Visual check unavailable (CLOUDCONVERT_API_KEY not set) — routed to review."); return result; }
+    try {
+      const images = [];
+      // First image = the vendor's finished PNG (already in memory).
+      images.push({ b64: vendorPng.buffer.toString("base64"), media: vendorPng.media || "image/png" });
+      // Then the client's originals (capped).
+      const capped = (clientFileUrls || []).slice(0, VISION.MAX_CLIENT_FILES);
+      for (const u of capped) {
+        try { images.push(await toVisionImage(u)); }
+        catch (e) { console.warn("[vision] client file convert failed:", e.message); }
+      }
+      if (images.length < 2) { result.ran = true; result.pass = false; result.failures.push("Could not prepare the client's original art for comparison — routed to review."); return result; }
+
+      const prompt = VISION.CHECKS.vector_visual.buildPrompt(instructions || "");
+      const content = [{ type: "text", text: prompt }];
+      images.forEach((im, i) => {
+        content.push({ type: "text", text: i === 0 ? "VENDOR'S FINISHED OUTPUT:" : ("CLIENT-PROVIDED FILE " + i + ":") });
+        content.push({ type: "image", source: { type: "base64", media_type: im.media, data: im.b64 } });
+      });
+
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": ANTHROPIC, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+        body: JSON.stringify({ model: VISION.VISION_MODEL, max_tokens: 400, messages: [{ role: "user", content }] }),
+      });
+      if (!res.ok) { result.ran = true; result.pass = false; result.failures.push("Visual check error (" + res.status + ") — routed to review."); return result; }
+      const data = await res.json();
+      const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("").trim();
+      const clean = text.replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+      let parsed; try { parsed = JSON.parse(clean); } catch (_) { result.ran = true; result.pass = false; result.failures.push("Visual check returned an unreadable result — routed to review."); return result; }
+
+      result.ran = true;
+      result.pass = parsed.pass === true;
+      if (!result.pass) {
+        const reasons = Array.isArray(parsed.reasons) ? parsed.reasons.filter(Boolean) : [];
+        result.failures.push(...(reasons.length ? reasons : ["The visual check flagged this order for review."]));
+      }
+      console.log(`[vision] pass=${result.pass} conf=${parsed.confidence} reasons=${(parsed.reasons||[]).length}`);
+      return result;
+    } catch (e) {
+      result.ran = true; result.pass = false; result.failures.push("Visual check could not complete (" + e.message + ") — routed to review.");
+      return result;
+    }
+  }
+
   async function uploadFileGetUrl(orderId, file) {
     await patchOrder(orderId, { vendor_scratch_file: bubbleFile(file) });
     const fresh = await getOrder(orderId);
@@ -927,6 +1053,7 @@ function mountVendorPortal(app, deps) {
       // source of truth; vendors skipped or fudged these anyway). Kept as optional
       // fallbacks only if present.
       const isEmbroidery = (o.Order_Type || "").toLowerCase() === "digitizing";
+      const isVector = (o.Order_Type || "").toLowerCase() === "vector";
       const height = String(req.body.height || "").trim();
       const width  = String(req.body.width  || "").trim();
       const stitch = String(req.body.stitchCount || "").trim();
@@ -952,6 +1079,28 @@ function mountVendorPortal(app, deps) {
           // the client-facing dimensions, so route to review rather than complete blind.
           qa = { ran: true, pass: false, failures: ["No .dst file found in the upload. Digitizing orders must include the .dst so we can verify size and stitch count."], preview: null };
           console.log(`[qa] order ${o["Order#"]}: no .dst among uploads -- routed to review`);
+        }
+      }
+
+      // ---- Automated QA on vector uploads (visual check) ---------------------
+      // Compare the vendor's completed PNG against the client's original art + any written
+      // instructions. Vendors must upload a PNG; if none is present, auto-flag (no AI call).
+      if (isVector && !isEditSubmit) {
+        // The vendor's completed PNG: prefer a .png among supporting files; fall back to a
+        // PNG preview. This is the deliverable we compare against the client's art.
+        // The vendor's completed PNG must be a .png in SUPPORTING FILES. The preview is a
+        // before/after JPEG that contains the client's original art, so it is never a valid
+        // comparison image -- no fallback to it.
+        const vendorPngFile = supportFiles.find((f) => /\.png$/i.test(f.originalname || ""));
+        if (!vendorPngFile) {
+          qa = { ran: true, pass: false, failures: ["No completed PNG uploaded by vendor. A PNG of the finished work is required for every order."], preview: null };
+          console.log(`[qa] order ${o["Order#"]}: vector, no PNG -- routed to review`);
+        } else {
+          const no = await newOrdersDetail(o["Order#"]);
+          const clientFiles = (no && no.uploadedFiles) || [];
+          const instr = (no && no.specialInstructions) || o.Special_Instructions || "";
+          qa = await runVectorVisualCheck({ buffer: vendorPngFile.buffer, media: "image/png" }, clientFiles, instr);
+          console.log(`[qa] order ${o["Order#"]}: vector visual ran=${qa.ran} pass=${qa.pass} failures=${qa.failures.length}`);
         }
       }
       const goToReview = qa.ran && !qa.pass;
