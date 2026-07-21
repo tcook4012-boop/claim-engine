@@ -897,13 +897,29 @@ function mountVendorPortal(app, deps) {
       const res = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: { "x-api-key": ANTHROPIC, "anthropic-version": "2023-06-01", "content-type": "application/json" },
-        body: JSON.stringify({ model: VISION.VISION_MODEL, max_tokens: 400, messages: [{ role: "user", content }] }),
+        body: JSON.stringify({ model: VISION.VISION_MODEL, max_tokens: 400,
+          system: "You are a strict visual QA inspector. You respond with ONLY a single JSON object and no other text, no markdown fences, no explanation before or after.",
+          messages: [{ role: "user", content }] }),
       });
       if (!res.ok) { result.ran = true; result.pass = false; result.failures.push("Visual check error (" + res.status + ") — routed to review."); return result; }
       const data = await res.json();
       const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("").trim();
-      const clean = text.replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
-      let parsed; try { parsed = JSON.parse(clean); } catch (_) { result.ran = true; result.pass = false; result.failures.push("Visual check returned an unreadable result — routed to review."); return result; }
+      // Robust extraction: Claude may wrap the JSON in prose or fences. Strip fences, then
+      // fall back to grabbing the outermost {...} if a direct parse fails.
+      let parsed = null;
+      const tryParse = (s) => { try { return JSON.parse(s); } catch (_) { return null; } };
+      const fenced = text.replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+      parsed = tryParse(fenced);
+      if (!parsed) {
+        const a = text.indexOf("{"), b = text.lastIndexOf("}");
+        if (a !== -1 && b !== -1 && b > a) parsed = tryParse(text.slice(a, b + 1));
+      }
+      if (!parsed) {
+        console.warn("[vision] unreadable response (first 300 chars):", text.slice(0, 300));
+        result.ran = true; result.pass = false;
+        result.failures.push("Visual check returned an unreadable result — routed to review.");
+        return result;
+      }
 
       result.ran = true;
       result.pass = parsed.pass === true;
@@ -1426,12 +1442,27 @@ function mountVendorPortal(app, deps) {
           inReview: inReview(o),
           reviewReasons: inReview(o) ? String(o.review_reasons || "") : "",
           reviewPreview: inReview(o) ? String(o.review_preview || "") : "",
+          specialInstructions: o.Special_Instructions || "",
         };
       }).sort((a, b) => {
         const av = a.claimedHours != null ? a.claimedHours : -1, bv = b.claimedHours != null ? b.claimedHours : -1;
         if (av !== bv) return bv - av;
         return (b.createdHours || 0) - (a.createdHours || 0);
       });
+      // Enrich review orders with the ORIGINAL request data (New_Order): the client's
+      // written instructions + their original files. The reviewer needs to see what the
+      // client actually asked for to judge the flag. Only for review orders (few), so the
+      // extra lookups are cheap.
+      const reviewOnes = orders.filter((o) => o.inReview);
+      await Promise.all(reviewOnes.map(async (o) => {
+        try {
+          const nd = await newOrdersDetail(o.orderNo);
+          if (nd) {
+            if (nd.specialInstructions) o.specialInstructions = nd.specialInstructions;
+            o.clientFiles = (nd.uploadedFiles || []).map((u) => String(u).startsWith("//") ? "https:" + u : String(u));
+          }
+        } catch (_) {}
+      }));
       const knownTypes = ["Vector", "Digitizing", "Digital (DTF/DTG)"];
       const hSinceClaim = (o) => (isClaimed(o) && o.claimed_at) ? (now - new Date(o.claimed_at).getTime()) / 3600000 : null;
       const totals = {
@@ -1972,6 +2003,11 @@ header a{color:#93c5fd;text-decoration:none;margin-left:14px;font-size:14px}
 .mini.m-review{background:#fecaca;color:#991b1b}
 .reviewbox{margin:10px 0;padding:12px 14px;background:#fef2f2;border:1px solid #fecaca;border-radius:8px}
 .reviewbox .tmpl-label{color:#991b1b}
+.rvinstr{margin:8px 0;padding:8px 10px;background:#fff;border:1px solid #e5e7eb;border-radius:6px;font-size:13px;color:#1f2937;line-height:1.4}
+.rvinstrlabel{font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.04em;margin-bottom:3px}
+.rvfiles{margin:8px 0}
+.rvfilelink{display:inline-block;font-size:12px;color:#2563eb;text-decoration:none;border:1px solid #bfdbfe;border-radius:6px;padding:3px 9px;margin:2px 4px 2px 0;background:#eff6ff}
+.rvfilelink:hover{background:#dbeafe}
 .rvlist{margin:6px 0;padding-left:18px;font-size:13px;color:#7f1d1d}
 .rvlist li{margin:2px 0}
 .rvprev{display:block;max-width:100%;border:1px solid #e5e7eb;border-radius:6px;margin:8px 0;background:#fff}
@@ -2360,9 +2396,12 @@ function fillPanel(o){
     var reasons=(o.reviewReasons||'').split(' | ').filter(function(x){return x;});
     var rlist=reasons.length?('<ul class=rvlist>'+reasons.map(function(x){return '<li>'+esc(x)+'</li>';}).join('')+'</ul>'):'<div class=specline>Flagged for manual review.</div>';
     var prev=o.reviewPreview?('<img src="'+esc(o.reviewPreview)+'" class=rvprev alt="stitch preview">'):'';
+    // Show what the CLIENT asked for, so the reviewer can judge the flag.
+    var instr=o.specialInstructions?('<div class=rvinstr><div class=rvinstrlabel>Client instructions:</div>'+esc(o.specialInstructions)+'</div>'):'<div class=rvinstr><div class=rvinstrlabel>Client instructions:</div><span style=color:#94a3b8>none provided</span></div>';
+    var cfiles=(o.clientFiles&&o.clientFiles.length)?('<div class=rvfiles><div class=rvinstrlabel>Client original files:</div>'+o.clientFiles.map(function(u,i){return '<a href="'+esc(u)+'" target="_blank" class=rvfilelink>Original '+(i+1)+'</a>';}).join(' ')+'</div>'):'';
     reviewBox='<div class=reviewbox><div class=tmpl-label>\\u26A0 Flagged by automated QA</div>'+
       (o.assigned?'<div class=specline><b>Vendor:</b> '+esc(shortUser(o.assigned))+'</div>':'')+
-      rlist+prev+
+      rlist+instr+cfiles+prev+
       '<div class=rvactions>'+
       '<button class=rvapprove onclick="reviewApprove(\\''+o.id+'\\')">\\u2713 Approve &amp; complete</button>'+
       '<button class=rvreject onclick="reviewReject(\\''+o.id+'\\')">\\u2717 Reject with notes</button>'+
