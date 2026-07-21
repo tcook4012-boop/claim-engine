@@ -850,22 +850,33 @@ function mountVendorPortal(app, deps) {
     throw new Error("CloudConvert timed out");
   }
 
-  // Fetch a URL and return { b64, media } for a Claude image block. Converts if needed.
+  // Downscale any image buffer to fit Anthropic's vision limits (<=1568px, well under 5MB)
+  // by shelling to Pillow (already installed for DST previews). Returns { b64, media } or
+  // throws. Prevents the 400 "image too large" errors.
+  function resizeForVision(buffer) {
+    return new Promise((resolve, reject) => {
+      const p = execFile("python3", [path.join(__dirname, "img_resize.py")], { maxBuffer: 30 * 1024 * 1024, timeout: 20000 },
+        (err, stdout) => {
+          if (err) return reject(new Error("resize failed: " + err.message));
+          if (!stdout || !stdout.length) return reject(new Error("resize produced no output"));
+          resolve({ b64: Buffer.from(stdout, "binary").toString("base64"), media: "image/jpeg" });
+        });
+      p.stdin.write(buffer); p.stdin.end();
+    });
+  }
+
+  // Fetch a URL and return { b64, media } for a Claude image block. Converts if needed,
+  // then always downscales so the vision request stays within limits.
   async function toVisionImage(fileUrl) {
     const ext = extOf(fileUrl);
-    let url = asHttps(fileUrl), media = "image/png";
-    if (VISION.NATIVE_IMAGE_EXT.includes(ext)) {
-      media = ext === "jpg" ? "image/jpeg" : ("image/" + (ext === "jpeg" ? "jpeg" : ext));
-    } else if (VISION.CONVERTIBLE_EXT.includes(ext)) {
-      url = await cloudConvertToPng(fileUrl); media = "image/png";
-    } else {
-      // Unknown type: try converting; if it fails, the caller routes to review.
-      url = await cloudConvertToPng(fileUrl); media = "image/png";
+    let url = asHttps(fileUrl);
+    if (VISION.CONVERTIBLE_EXT.includes(ext) || !VISION.NATIVE_IMAGE_EXT.includes(ext)) {
+      url = await cloudConvertToPng(fileUrl);
     }
     const resp = await fetch(url);
     if (!resp.ok) throw new Error("download failed " + resp.status);
     const buf = Buffer.from(await resp.arrayBuffer());
-    return { b64: buf.toString("base64"), media };
+    return await resizeForVision(buf);
   }
 
   // Run the vector visual check. vendorPng = { buffer, media } from the upload (in memory);
@@ -877,8 +888,16 @@ function mountVendorPortal(app, deps) {
     if (!CLOUDCONVERT_KEY) { result.ran = true; result.pass = false; result.failures.push("Visual check unavailable (CLOUDCONVERT_API_KEY not set) — routed to review."); return result; }
     try {
       const images = [];
-      // First image = the vendor's finished PNG (already in memory).
-      images.push({ b64: vendorPng.buffer.toString("base64"), media: vendorPng.media || "image/png" });
+      // First image = the vendor's finished PNG (already in memory). Downscale it too --
+      // finished art is often the largest image and the usual cause of a 400.
+      try {
+        images.push(await resizeForVision(vendorPng.buffer));
+      } catch (e) {
+        result.ran = true; result.pass = false;
+        result.failures.push("Could not process the vendor's PNG for the visual check — routed to review.");
+        console.warn("[vision] vendor PNG resize failed:", e.message);
+        return result;
+      }
       // Then the client's originals (capped).
       const capped = (clientFileUrls || []).slice(0, VISION.MAX_CLIENT_FILES);
       for (const u of capped) {
@@ -901,7 +920,13 @@ function mountVendorPortal(app, deps) {
           system: "You are a strict visual QA inspector. You respond with ONLY a single JSON object and no other text, no markdown fences, no explanation before or after.",
           messages: [{ role: "user", content }] }),
       });
-      if (!res.ok) { result.ran = true; result.pass = false; result.failures.push("Visual check error (" + res.status + ") — routed to review."); return result; }
+      if (!res.ok) {
+        const body = await res.text();
+        console.warn("[vision] API " + res.status + ": " + body.slice(0, 300));
+        result.ran = true; result.pass = false;
+        result.failures.push("Visual check error (" + res.status + ") — routed to review.");
+        return result;
+      }
       const data = await res.json();
       const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("").trim();
       // Robust extraction: Claude may wrap the JSON in prose or fences. Strip fences, then
